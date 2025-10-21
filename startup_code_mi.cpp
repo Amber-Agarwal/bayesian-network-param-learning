@@ -1,4 +1,4 @@
-// startup_code.cpp
+// startup_code.cpp  — Multiple Imputation EM (MI-EM) version
 #include <iostream>
 #include <string>
 #include <vector>
@@ -13,16 +13,13 @@
 #include <climits>
 #include <limits>
 #include <stdexcept>
+#include <random>
+#include <algorithm>
 
 using namespace std;
 
 //
 // ========================= Graph_Node =========================
-//  - Keeps your original public API (getters, setters)
-//  - Adds fast caches:
-//      * value -> index (Val2Idx)
-//      * parent indices (PIdx), radices (PRad), strides (PStr)
-//  - Mixed-radix row addressing via row_base_from_assign_code()
 //
 
 class Graph_Node {
@@ -34,11 +31,11 @@ private:
     vector<string> values;
     vector<float> CPT;
 
-    // ==== OPT caches ====
-    vector<int> PIdx;                 // indices of parents in the network
-    vector<int> PRad;                 // parent domain sizes
-    vector<int> PStr;                 // mixed-radix strides (rightmost cycles fastest)
-    unordered_map<string,int> Val2Idx;// value->index
+    // caches
+    vector<int> PIdx;                 // parent index in network order
+    vector<int> PRad;                 // parent cardinalities
+    vector<int> PStr;                 // mixed-radix strides (rightmost fastest)
+    unordered_map<string,int> Val2Idx; // value -> index
 
 public:
     Graph_Node(string name, int n, vector<string> vals) {
@@ -47,40 +44,34 @@ public:
         values = std::move(vals);
     }
 
-    // --- original getters/setters (signatures unchanged) ---
+    // original API
     string get_name() { return Node_Name; }
     vector<int> get_children() { return Children; }
     vector<string> get_Parents() { return Parents; }
     vector<float> get_CPT() { return CPT; }
     int get_nvalues() { return nvalues; }
     vector<string> get_values() { return values; }
-
     void set_CPT(vector<float> new_CPT) { CPT.swap(new_CPT); }
     void set_Parents(vector<string> Parent_Nodes) { Parents = std::move(Parent_Nodes); }
-
     int add_child(int new_child_index) {
         for (int c : Children) if (c == new_child_index) return 0;
         Children.push_back(new_child_index);
         return 1;
     }
 
-    // ==== OPT helpers ====
+    // caches
     void build_value_index() {
-        Val2Idx.clear();
-        Val2Idx.reserve(values.size()*2+1);
+        Val2Idx.clear(); Val2Idx.reserve(values.size()*2+1);
         for (int i = 0; i < (int)values.size(); ++i) Val2Idx[values[i]] = i;
     }
     inline int vindex_fast(const string& v) const {
         auto it = Val2Idx.find(v);
         return (it == Val2Idx.end() ? -1 : it->second);
     }
-
-    // Build parent caches once network has index/name caches
     void build_parent_cache(const vector<list<Graph_Node>::iterator>& idx2it,
                             const unordered_map<string,int>& name2idx) {
         PIdx.clear(); PRad.clear(); PStr.clear();
-        PIdx.reserve(Parents.size());
-        PRad.reserve(Parents.size());
+        PIdx.reserve(Parents.size()); PRad.reserve(Parents.size());
         for (const auto& pn : Parents) {
             auto it = name2idx.find(pn);
             if (it == name2idx.end()) continue;
@@ -88,109 +79,80 @@ public:
             PIdx.push_back(pi);
             PRad.push_back(idx2it[pi]->get_nvalues());
         }
-        // strides: rightmost parent cycles fastest
         PStr.assign(PRad.size(), 0);
         int stride = 1;
         for (int i = (int)PRad.size()-1; i >= 0; --i) {
             PStr[i] = stride;
-            if (PRad[i] > 0 && stride > INT_MAX / PRad[i])
-                throw runtime_error("Parent combos overflow");
+            if (PRad[i] > 0 && stride > INT_MAX / PRad[i]) throw runtime_error("Parent combos overflow");
             stride *= PRad[i];
         }
     }
-
-    // Accessors for caches
     inline const vector<int>& parents_idx() const { return PIdx; }
     inline const vector<int>& parent_rad()  const { return PRad; }
     inline const vector<int>& parent_str()  const { return PStr; }
-
-    // Mixed-radix row base (code * nvalues)
     inline int row_base_from_assign_code(int code) const { return code * nvalues; }
 };
 
-
 //
 // ============================ network ============================
-//  - Keeps your original list-based structure and public methods
-//  - Adds O(1) index->iterator cache and name->index map
 //
 
 class network {
     list<Graph_Node> Pres_Graph;
 
-    // ==== OPT caches ====
+    // caches
     vector<list<Graph_Node>::iterator> index_cache;
     unordered_map<string,int> name2idx;
 
 public:
-    int addNode(Graph_Node node) {
-        Pres_Graph.push_back(std::move(node));
-        return 0;
-    }
+    int addNode(Graph_Node node) { Pres_Graph.push_back(std::move(node)); return 0; }
 
     list<Graph_Node>::iterator getNode(int i) {
         int count = 0;
-        list<Graph_Node>::iterator listIt;
-        for (listIt = Pres_Graph.begin(); listIt != Pres_Graph.end(); listIt++) {
-            if (count++ == i) break;
-        }
-        return listIt;
-    }
-
-    int netSize() {
-        return (int)Pres_Graph.size();
-    }
-
-    int get_index(string val_name) {
-        list<Graph_Node>::iterator listIt;
-        int count = 0;
-        for (listIt = Pres_Graph.begin(); listIt != Pres_Graph.end(); listIt++) {
-            if (listIt->get_name().compare(val_name) == 0)
-                return count;
-            count++;
-        }
-        return -1;
-    }
-
-    list<Graph_Node>::iterator get_nth_node(int n) {
-        int count = 0;
         for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it) {
-            if (count == n) return it;
-            count++;
+            if (count++ == i) return it;
         }
         return Pres_Graph.end();
     }
+    int netSize() { return (int)Pres_Graph.size(); }
 
+    int get_index(string val_name) {
+        int count = 0;
+        for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it, ++count)
+            if (it->get_name() == val_name) return count;
+        return -1;
+    }
+    list<Graph_Node>::iterator get_nth_node(int n) {
+        int count = 0;
+        for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it, ++count)
+            if (count == n) return it;
+        return Pres_Graph.end();
+    }
     list<Graph_Node>::iterator search_node(string val_name) {
-        for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it) {
-            if (it->get_name().compare(val_name) == 0)
-                return it;
-        }
+        for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it)
+            if (it->get_name() == val_name) return it;
         cout << "node not found: " << val_name << "\n";
         return Pres_Graph.end();
     }
 
-    // ==== OPT: finalize caches after building the graph ====
+    // caches
     void finalize_index_cache() {
         index_cache.clear(); index_cache.reserve(Pres_Graph.size());
-        name2idx.clear();    name2idx.reserve(Pres_Graph.size()*2+1);
+        name2idx.clear(); name2idx.reserve(Pres_Graph.size()*2+1);
         int i = 0;
         for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it, ++i) {
             index_cache.push_back(it);
             name2idx[it->get_name()] = i;
         }
     }
-    // Fast getters used by optimized routines
     list<Graph_Node>::iterator fast_get(int i) { return index_cache[i]; }
     int fast_index_of(const string& name) const {
         auto it = name2idx.find(name);
         return (it == name2idx.end() ? -1 : it->second);
     }
-    // expose caches for parent-cache building
     const vector<list<Graph_Node>::iterator>& get_index_cache() const { return index_cache; }
     const unordered_map<string,int>& get_name_map() const { return name2idx; }
 };
-
 
 //
 // ====================== misc helpers and I/O ======================
@@ -215,22 +177,13 @@ network read_network(const char* filename) {
 
     while (getline(myfile, line)) {
         line = trim(line);
-
         if (line.empty() || line[0] == '#') continue;
 
-        string token;
-        {
-            stringstream ss(line);
-            ss >> token;
-        }
+        string token; { stringstream ss(line); ss >> token; }
 
         if (token == "variable") {
-            string var_name; {
-                stringstream ss(line);
-                ss >> token >> var_name;
-            }
+            string var_name; { stringstream ss(line); ss >> token >> var_name; }
 
-            // Next line: type + values
             if (!getline(myfile, line)) break;
             stringstream ss2(line);
 
@@ -245,49 +198,38 @@ network read_network(const char* filename) {
                 if (!value.empty() && value.back() == ',') value.pop_back();
                 values.push_back(value);
             }
-
-            Graph_Node new_node(var_name, num_values, values);
-            BayesNet.addNode(std::move(new_node));
+            BayesNet.addNode(Graph_Node(var_name, num_values, values));
         }
         else if (token == "probability") {
-            string full_prob_line = line;
-            while (full_prob_line.find('{') == string::npos) {
-                string next_line;
-                if (!getline(myfile, next_line)) break;
-                full_prob_line += " " + trim(next_line);
+            string full = line;
+            while (full.find('{') == string::npos) {
+                string next_line; if (!getline(myfile, next_line)) break;
+                full += " " + trim(next_line);
             }
+            size_t lp = full.find('('), rp = full.find(')'), bar = full.find('|');
+            if (lp == string::npos || rp == string::npos) continue;
 
-            size_t start_paren = full_prob_line.find('(');
-            size_t end_paren   = full_prob_line.find(')');
-            size_t pipe_pos    = full_prob_line.find('|');
+            string inside = full.substr(lp + 1, rp - lp - 1);
+            stringstream hs(inside);
+            string node_name; hs >> node_name;
 
-            if (start_paren == string::npos || end_paren == string::npos) continue;
-
-            string prob_content = full_prob_line.substr(start_paren + 1, end_paren - start_paren - 1);
-            stringstream prob_ss(prob_content);
-
-            string node_name; prob_ss >> node_name;
-
-            // set parents
             auto listIt = BayesNet.search_node(node_name);
-            int index   = BayesNet.get_index(node_name);
+            int index = BayesNet.get_index(node_name);
 
             vector<string> parents;
-            if (pipe_pos != string::npos && pipe_pos < end_paren) {
-                string parents_str = full_prob_line.substr(pipe_pos + 1, end_paren - pipe_pos - 1);
-                stringstream parent_ss(parents_str);
-                string parent;
-                while (parent_ss >> parent) {
-                    if (!parent.empty() && parent.back() == ',') parent.pop_back();
-                    parents.push_back(parent);
-
-                    auto parentIt = BayesNet.search_node(parent);
-                    parentIt->add_child(index);
+            if (bar != string::npos && bar < rp) {
+                string parents_str = full.substr(bar + 1, rp - bar - 1);
+                stringstream ps(parents_str);
+                string p;
+                while (ps >> p) {
+                    if (!p.empty() && p.back() == ',') p.pop_back();
+                    parents.push_back(p);
+                    auto pit = BayesNet.search_node(p);
+                    pit->add_child(index);
                 }
             }
             listIt->set_Parents(parents);
 
-            // Read CPT block
             vector<float> cpt;
             while (getline(myfile, line)) {
                 line = trim(line);
@@ -295,52 +237,33 @@ network read_network(const char* filename) {
                 if (line.empty()) continue;
 
                 size_t close_paren = line.find(')');
-                string prob_part;
-                if (close_paren != string::npos) {
-                    prob_part = line.substr(close_paren + 1);
-                } else if (line.find("table") != string::npos) {
-                    size_t table_pos = line.find("table");
-                    prob_part = line.substr(table_pos + 5);
-                } else {
-                    prob_part = line;
-                }
+                string part;
+                if (close_paren != string::npos) part = line.substr(close_paren + 1);
+                else if (line.find("table") != string::npos) { size_t t = line.find("table"); part = line.substr(t + 5); }
+                else part = line;
 
-                string tok;
-                stringstream ss_prob(prob_part);
+                string tok; stringstream ss_prob(part);
                 while (ss_prob >> tok) {
-                    while (!tok.empty() && (tok.back() == ',' || tok.back() == ';'))
-                        tok.pop_back();
-                    if (!tok.empty() && (isdigit((unsigned char)tok[0]) || tok[0] == '.' || tok[0] == '-' || tok[0] == '+')) {
+                    while (!tok.empty() && (tok.back() == ',' || tok.back() == ';')) tok.pop_back();
+                    if (!tok.empty() && (isdigit((unsigned char)tok[0]) || tok[0]=='.' || tok[0]=='-' || tok[0]=='+'))
                         cpt.push_back(static_cast<float>(atof(tok.c_str())));
-                    }
                 }
             }
             listIt->set_CPT(cpt);
         }
     }
-
     myfile.close();
 
-    // ==== Build global caches ====
     BayesNet.finalize_index_cache();
-
-    // Per-node caches: value map and parent mixed-radix helpers
     const int N = BayesNet.netSize();
-    for (int i = 0; i < N; ++i) {
-        auto node = BayesNet.fast_get(i);
-        node->build_value_index();
-    }
-    for (int i = 0; i < N; ++i) {
-        auto node = BayesNet.fast_get(i);
-        node->build_parent_cache(BayesNet.get_index_cache(), BayesNet.get_name_map());
-    }
+    for (int i = 0; i < N; ++i) BayesNet.fast_get(i)->build_value_index();
+    for (int i = 0; i < N; ++i) BayesNet.fast_get(i)->build_parent_cache(BayesNet.get_index_cache(), BayesNet.get_name_map());
 
     return BayesNet;
 }
 
 void write_network(const char* filename, network& BayesNet) {
     ofstream outfile(filename);
-
     if (!outfile.is_open()) {
         cout << "Error: Could not open file " << filename << " for writing" << endl;
         return;
@@ -350,7 +273,6 @@ void write_network(const char* filename, network& BayesNet) {
 
     int N = BayesNet.netSize();
 
-    // Nodes
     for (int i = 0; i < N; i++) {
         auto node = BayesNet.get_nth_node(i);
 
@@ -366,7 +288,6 @@ void write_network(const char* filename, network& BayesNet) {
         outfile << "}" << endl;
     }
 
-    // Probability tables
     outfile << std::fixed << std::setprecision(6);
     for (int i = 0; i < N; i++) {
         auto node = BayesNet.get_nth_node(i);
@@ -384,7 +305,6 @@ void write_network(const char* filename, network& BayesNet) {
         }
         outfile << " ) {" << endl;
 
-        // parent radices
         vector<int> radices; radices.reserve(parents.size());
         for (auto &pname : parents) {
             auto pnode = BayesNet.search_node(pname);
@@ -439,15 +359,13 @@ void write_network(const char* filename, network& BayesNet) {
     cout << "Network written to file: " << filename << endl;
 }
 
-// Original helper retained (not used by fast path, but harmless)
+// legacy helpers (kept)
 int value_index(const vector<string>& values, const string& val) {
     for (int i = 0; i < (int)values.size(); ++i) {
         if (values[i] == val) return i;
     }
     return -1;
 }
-
-// Original helper retained (legacy callers)
 int get_cpt_index(network& net, Graph_Node& node, const vector<int>& assignment) {
     vector<string> parents = node.get_Parents();
     vector<int> radices;
@@ -455,12 +373,8 @@ int get_cpt_index(network& net, Graph_Node& node, const vector<int>& assignment)
         auto pnode = net.search_node(p);
         radices.push_back(pnode->get_nvalues());
     }
-
     int index = 0, factor = 1;
-    for (int i = (int)parents.size() - 1; i >= 0; --i) {
-        index += assignment[i] * factor;
-        factor *= radices[i];
-    }
+    for (int i = (int)parents.size() - 1; i >= 0; --i) { index += assignment[i] * factor; factor *= radices[i]; }
     return index * node.get_nvalues();
 }
 
@@ -482,7 +396,6 @@ inline int parent_code_fast(network& net, Graph_Node& node, const vector<string>
     }
     return code;
 }
-
 inline int parent_code_with_override(network& net, Graph_Node& node, const vector<string>& row,
                                      int override_idx, int override_val) {
     const auto& PIdx = node.parents_idx();
@@ -546,7 +459,6 @@ void initialize_cpts_complete_case(network& net, const vector<vector<string>>& d
         }
     }
 
-    // Normalize and set
     for (int i = 0; i < N; ++i) {
         auto node = net.fast_get(i);
         auto& c = counts[i];
@@ -567,24 +479,20 @@ void initialize_cpts_complete_case(network& net, const vector<vector<string>>& d
 }
 
 //
-// ============================= Hard-EM =============================
+// ============================= Soft-EM (kept) =============================
 //
 
-void run_hard_em(network& net, const vector<vector<string>>& data, int max_iter = 5) {
+void run_soft_em(network& net, const vector<vector<string>>& data, int max_iter = 7) {
     const int N = net.netSize();
     const int D = (int)data.size();
     const float tiny = 1e-12f;
 
     for (int iter = 0; iter < max_iter; ++iter) {
         vector<vector<float>> counts(N);
-        // fresh counts with small pseudo-count to avoid zeros
         for (int i = 0; i < N; ++i) {
             auto node = net.fast_get(i);
             long long prod = 1;
-            for (int r : node->parent_rad()) {
-                if (r <= 0 || prod > (LLONG_MAX / r)) throw runtime_error("Parent combos too large");
-                prod *= r;
-            }
+            for (int r : node->parent_rad()) { if (r <= 0 || prod > (LLONG_MAX / r)) throw runtime_error("Parent combos too large"); prod *= r; }
             counts[i].assign((int)prod * node->get_nvalues(), 1e-3f);
         }
 
@@ -594,77 +502,277 @@ void run_hard_em(network& net, const vector<vector<string>>& data, int max_iter 
 
             int missing_idx = -1, q = 0;
             for (int i = 0; i < N; ++i) if (row[i] == "?" && ++q == 1) missing_idx = i;
-            if (q > 1) continue; // skip rows with >1 missing
+            if (q > 1) continue;
 
-            auto accumulate = [&](const vector<string>& rec) {
+            if (q == 0) {
                 for (int i = 0; i < N; ++i) {
                     auto node = net.fast_get(i);
-                    int x = node->vindex_fast(rec[i]);
+                    int x = node->vindex_fast(row[i]);
                     if (x < 0) continue;
-                    int code = parent_code_fast(net, *node, rec);
+                    int code = parent_code_fast(net, *node, row);
                     if (code < 0) continue;
                     int base = node->row_base_from_assign_code(code);
                     counts[i][base + x] += 1.0f;
                 }
-            };
-
-            if (q == 0) {
-                accumulate(row);
             } else {
                 auto mnode = net.fast_get(missing_idx);
+
                 int m_code = parent_code_fast(net, *mnode, row);
                 if (m_code < 0) continue;
-
                 int m_base = mnode->row_base_from_assign_code(m_code);
                 const auto mC = mnode->get_CPT();
 
-                int best_v = 0; float best_p = -1.0f;
-
+                vector<double> w(mnode->get_nvalues(), 0.0);
+                double wsum = 0.0;
                 for (int v = 0; v < mnode->get_nvalues(); ++v) {
-                    float p = std::max(tiny, mC[m_base + v]);
-
-                    // children likelihoods
+                    double p = std::max<double>(tiny, mC[m_base + v]);
                     for (int ci : mnode->get_children()) {
                         auto child = net.fast_get(ci);
                         int y = child->vindex_fast(row[ci]);
-                        if (y < 0) { p = 0.0f; break; }
-
+                        if (y < 0) { p = 0.0; break; }
                         int c_code = parent_code_with_override(net, *child, row, missing_idx, v);
-                        if (c_code < 0) { p = 0.0f; break; }
-
+                        if (c_code < 0) { p = 0.0; break; }
                         int cb = child->row_base_from_assign_code(c_code);
                         const auto cC = child->get_CPT();
-                        p *= std::max(tiny, cC[cb + y]);
-                        if (p == 0.0f) break;
+                        p *= std::max<double>(tiny, cC[cb + y]);
+                        if (p == 0.0) break;
                     }
-                    if (p > best_p) { best_p = p; best_v = v; }
+                    w[v] = p; wsum += p;
                 }
+                if (wsum <= 0.0) continue;
+                for (auto& t : w) t = (float)(t / wsum);
 
-                vector<string> imputed = row;
-                imputed[missing_idx] = mnode->get_values()[best_v];
-                accumulate(imputed);
+                for (int i = 0; i < N; ++i) {
+                    auto node = net.fast_get(i);
+                    if (i == missing_idx) {
+                        int base = m_base;
+                        for (int v = 0; v < node->get_nvalues(); ++v) counts[i][base + v] += (float)w[v];
+                        continue;
+                    }
+                    bool depends_on_m = false;
+                    for (int pi : node->parents_idx()) if (pi == missing_idx) { depends_on_m = true; break; }
+
+                    if (depends_on_m) {
+                        int x = node->vindex_fast(row[i]);
+                        if (x < 0) continue;
+                        for (int v = 0; v < (int)w.size(); ++v) {
+                            if (w[v] <= 0.f) continue;
+                            int code = parent_code_with_override(net, *node, row, missing_idx, v);
+                            if (code < 0) continue;
+                            int base = node->row_base_from_assign_code(code);
+                            counts[i][base + x] += (float)w[v];
+                        }
+                    } else {
+                        int x = node->vindex_fast(row[i]);
+                        if (x < 0) continue;
+                        int code = parent_code_fast(net, *node, row);
+                        if (code < 0) continue;
+                        int base = node->row_base_from_assign_code(code);
+                        counts[i][base + x] += 1.0f;
+                    }
+                }
             }
         }
 
-        // M-step: normalize
+        // M-step
         for (int i = 0; i < N; ++i) {
             auto node = net.fast_get(i);
             auto& cpt = counts[i];
             const int K = node->get_nvalues();
-            for (int off = 0; off  < (int)cpt.size(); off += K) {
+            for (int off = 0; off < (int)cpt.size(); off += K) {
                 float s = 0.0f;
                 for (int k = 0; k < K; ++k) s += cpt[off + k];
-                if (s <= 0.0f) {
-                    for (int k = 0; k < K; ++k) cpt[off + k] = 1.0f / K;
-                } else {
+                if (s <= 0.0f) { for (int k = 0; k < K; ++k) cpt[off + k] = 1.0f / K; }
+                else {
                     float inv = 1.0f / s;
                     for (int k = 0; k < K; ++k) cpt[off + k] *= inv;
                 }
             }
             node->set_CPT(cpt);
         }
+        cout << "Soft-EM iteration " << iter + 1 << " complete." << endl;
+    }
+}
 
-        cout << "Iteration " << iter + 1 << " complete." << endl;
+//
+// ======================= Multiple Imputation EM =======================
+//
+// We iterate:
+//  1) Using current CPTs, generate M completed datasets via Gibbs sampling per row.
+//     (Burn-in + few sweeps over missing variables using Markov blanket conditionals.)
+//  2) Average counts across the M datasets (with small pseudo-count).
+//  3) Normalize rows to update CPTs.
+//  4) Repeat for 'em_iters' iterations.
+//
+static inline int sample_categorical(const vector<double>& probs, std::mt19937& rng) {
+    std::discrete_distribution<int> dist(probs.begin(), probs.end());
+    return dist(rng);
+}
+
+// Compute unnormalized P(X=v | Markov blanket) for node i given a row that may contain other imputed values.
+// This uses CPTs and current assignments in `row`.
+static inline void markov_blanket_probs(network& net, int node_idx, const vector<string>& row,
+                                        vector<double>& out, double tiny=1e-12) {
+    auto node = net.fast_get(node_idx);
+    const int V = node->get_nvalues();
+    out.assign(V, 0.0);
+
+    // Parent code for node given current row (requires all parents observed/imputed)
+    int pcode = parent_code_fast(net, *node, row);
+    if (pcode < 0) { // if parents still have '?', fallback to uniform to keep sampler going
+        for (int v = 0; v < V; ++v) out[v] = 1.0;
+        return;
+    }
+    int base = node->row_base_from_assign_code(pcode);
+    const auto nodeCPT = node->get_CPT();
+
+    for (int v = 0; v < V; ++v) {
+        double p = std::max<double>(tiny, nodeCPT[base + v]);
+        // children likelihoods
+        for (int ci : node->get_children()) {
+            auto child = net.fast_get(ci);
+            // build child parent code with node set to v
+            int ccode = parent_code_with_override(net, *child, row, node_idx, v);
+            if (ccode < 0) { p = 0.0; break; }
+            int cb = child->row_base_from_assign_code(ccode);
+            int y = child->vindex_fast(row[ci]);
+            if (y < 0) { p = 0.0; break; }
+            const auto cCPT = child->get_CPT();
+            p *= std::max<double>(tiny, cCPT[cb + y]);
+            if (p == 0.0) break;
+        }
+        out[v] = p;
+    }
+}
+
+// One imputation sweep for a single row: Gibbs updates every missing variable once.
+static inline void gibbs_sweep_row(network& net, vector<string>& row, const vector<int>& miss_idx,
+                                   std::mt19937& rng) {
+    vector<double> probs;
+    for (int idx : miss_idx) {
+        // compute P(X=· | MB) and sample
+        markov_blanket_probs(net, idx, row, probs);
+        // normalize
+        double s = 0.0; for (double v : probs) s += v; if (s <= 0) {
+            // uniform fallback
+            int V = net.fast_get(idx)->get_nvalues();
+            probs.assign(V, 1.0);
+            s = (double)V;
+        }
+        for (double& v : probs) v /= s;
+        int V = net.fast_get(idx)->get_nvalues();
+        int sampled = sample_categorical(probs, rng);
+        sampled = std::min(std::max(sampled, 0), V-1);
+        row[idx] = net.fast_get(idx)->get_values()[sampled];
+    }
+}
+
+// Produce ONE completed dataset by imputing all '?' using Gibbs sampling given current CPTs.
+// - burnin_sweeps: initial sweeps discarded
+// - sample_sweeps: additional sweeps; we return the final state (last sweep).
+static vector<vector<string>> impute_dataset_once(network& net, const vector<vector<string>>& data,
+                                                  int burnin_sweeps, int sample_sweeps,
+                                                  std::mt19937& rng) {
+    const int N = net.netSize();
+    vector<vector<string>> imputed = data;
+
+    // Precompute missing index lists per row and cheap initialization
+    for (auto& row : imputed) {
+        if ((int)row.size() != N) continue;
+        vector<int> miss;
+        miss.reserve(N);
+        for (int i = 0; i < N; ++i) if (row[i] == "?") miss.push_back(i);
+
+        if (miss.empty()) continue;
+
+        // Cheap init for missing: use parent CPT row mode if parents observed; else uniform random
+        for (int idx : miss) {
+            auto node = net.fast_get(idx);
+            int code = parent_code_fast(net, *node, row);
+            int V = node->get_nvalues();
+            if (code >= 0) {
+                int base = node->row_base_from_assign_code(code);
+                const auto cpt = node->get_CPT();
+                // mode
+                int argmax = 0; float best = -1.0f;
+                for (int v = 0; v < V; ++v) if (cpt[base+v] > best) { best=cpt[base+v]; argmax=v; }
+                row[idx] = node->get_values()[argmax];
+            } else {
+                std::uniform_int_distribution<int> uni(0, V-1);
+                row[idx] = node->get_values()[uni(rng)];
+            }
+        }
+
+        // Burn-in + sample sweeps
+        for (int b = 0; b < burnin_sweeps; ++b) gibbs_sweep_row(net, row, miss, rng);
+        for (int s = 0; s < sample_sweeps; ++s) gibbs_sweep_row(net, row, miss, rng);
+    }
+
+    return imputed;
+}
+
+// Multiple-Imputation EM
+// em_iters     : outer EM iterations
+// M            : number of imputations per iteration
+// burnin       : Gibbs burn-in sweeps per row
+// sweeps       : Gibbs posterior sweeps per row (return last state)
+// pseudo       : small count to avoid zeros
+void run_multiple_imputation_em(network& net, const vector<vector<string>>& data,
+                                int em_iters = 5, int M = 5,
+                                int burnin = 1, int sweeps = 1,
+                                float pseudo = 1e-3f) {
+    if (M < 1) M = 1;
+    std::random_device rd;
+    std::mt19937 rng(rd());
+
+    const int N = net.netSize();
+
+    for (int it = 0; it < em_iters; ++it) {
+        // aggregate counts (start with pseudo-counts)
+        vector<vector<float>> agg_counts(N);
+        for (int i = 0; i < N; ++i) {
+            auto node = net.fast_get(i);
+            long long prod = 1;
+            for (int r : node->parent_rad()) { if (r <= 0 || prod > (LLONG_MAX / r)) throw runtime_error("Parent combos too large"); prod *= r; }
+            agg_counts[i].assign((int)prod * node->get_nvalues(), pseudo);
+        }
+
+        // Generate M completed datasets and accumulate counts
+        for (int m = 0; m < M; ++m) {
+            // Impute one dataset using current CPTs
+            auto completed = impute_dataset_once(net, data, burnin, sweeps, rng);
+
+            // Add complete-data counts
+            for (const auto& row : completed) {
+                if ((int)row.size() != N) continue;
+                for (int i = 0; i < N; ++i) {
+                    auto node = net.fast_get(i);
+                    int x = node->vindex_fast(row[i]);
+                    if (x < 0) continue;
+                    int code = parent_code_fast(net, *node, row);
+                    if (code < 0) continue; // shouldn’t happen after imputation
+                    int base = node->row_base_from_assign_code(code);
+                    agg_counts[i][base + x] += 1.0f;
+                }
+            }
+        }
+
+        // M-step: normalize per-row to update CPTs (equally weighted across imputations)
+        for (int i = 0; i < N; ++i) {
+            auto node = net.fast_get(i);
+            auto& cpt = agg_counts[i];
+            const int K = node->get_nvalues();
+            for (int off = 0; off < (int)cpt.size(); off += K) {
+                float s = 0.0f; for (int k = 0; k < K; ++k) s += cpt[off + k];
+                if (s <= 0.0f) { for (int k = 0; k < K; ++k) cpt[off + k] = 1.0f / K; }
+                else {
+                    float inv = 1.0f / s;
+                    for (int k = 0; k < K; ++k) cpt[off + k] *= inv;
+                }
+            }
+            node->set_CPT(cpt);
+        }
+        cout << "MI-EM iteration " << (it+1) << " complete (M=" << M << ")." << endl;
     }
 }
 
@@ -685,58 +793,35 @@ vector<vector<string>> read_data(const string& filename) {
     }
     return data;
 }
-
-// --- utils: trim helpers ---
-static inline void rtrim_cr(std::string& s) {
-    if (!s.empty() && s.back() == '\r') s.pop_back();
-}
+static inline void rtrim_cr(std::string& s) { if (!s.empty() && s.back() == '\r') s.pop_back(); }
 static inline std::string strip_quotes(const std::string& s) {
-    if (s.size() >= 2 && s.front() == '"' && s.back() == '"')
-        return s.substr(1, s.size() - 2);
+    if (s.size() >= 2 && s.front() == '"' && s.back() == '"') return s.substr(1, s.size() - 2);
     return s;
 }
-
-// --- CSV line parser: handles commas and double-quotes ---
 static std::vector<std::string> parse_csv_line(const std::string& line_in) {
-    std::vector<std::string> out;
-    std::string field;
-    bool in_quotes = false;
-
+    std::vector<std::string> out; std::string field; bool in_quotes = false;
     for (size_t i = 0; i < line_in.size(); ++i) {
         char c = line_in[i];
-        if (c == '"') {
-            in_quotes = !in_quotes;
-            field.push_back(c);
-        } else if (c == ',' && !in_quotes) {
-            out.push_back(strip_quotes(field));
-            field.clear();
-        } else {
-            field.push_back(c);
-        }
+        if (c == '"') { in_quotes = !in_quotes; field.push_back(c); }
+        else if (c == ',' && !in_quotes) { out.push_back(strip_quotes(field)); field.clear(); }
+        else { field.push_back(c); }
     }
     out.push_back(strip_quotes(field));
     return out;
 }
-
-// --- Loader: one row per line ---
 std::vector<std::vector<std::string>> load_records_csv(const std::string& path) {
     std::ifstream in(path);
-    if (!in) {
-        std::cerr << "Could not open " << path << "\n";
-        return {};
-    }
+    if (!in) { std::cerr << "Could not open " << path << "\n"; return {}; }
     std::vector<std::vector<std::string>> data;
     std::string line;
     while (std::getline(in, line)) {
-        rtrim_cr(line);
-        if (line.empty()) continue;
+        rtrim_cr(line); if (line.empty()) continue;
         auto row = parse_csv_line(line);
         data.push_back(std::move(row));
     }
     std::cerr << "Loaded " << data.size() << " records.\n";
     return data;
 }
-
 void validate_dataset(network& net, const vector<vector<string>>& data, int max_report=10) {
     int N = net.netSize();
     int bad_rows = 0, bad_tokens = 0, missing_multi = 0;
@@ -782,11 +867,20 @@ int main() {
     cout << "Loaded " << dataset.size() << " records." << endl;
     validate_dataset(BayesNet, dataset);
 
-    // Good initialization before EM
+    // Good starting point:
     initialize_cpts_complete_case(BayesNet, dataset);
 
-    // A few more iterations usually helps (5–10)
-    run_hard_em(BayesNet, dataset, 7);
+    // ---- Choose ONE training strategy ----
+    // 1) Soft EM:
+    // run_soft_em(BayesNet, dataset, /*iters=*/7);
+
+    // 2) Multiple-Imputation EM (recommended when rows have multiple '?'):
+    run_multiple_imputation_em(BayesNet, dataset,
+                               /*em_iters=*/6,
+                               /*M=*/5,
+                               /*burnin=*/1,
+                               /*sweeps=*/1,
+                               /*pseudo=*/1e-3f);
 
     write_network("solved.bif", BayesNet);
     return 0;
