@@ -15,6 +15,9 @@
 #include <stdexcept>
 #include <random>
 #include <algorithm>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using namespace std;
 
@@ -231,12 +234,24 @@ void write_network(const char* filename, network& BayesNet) {
         outfile << " };\n}\n";
     }
 
-    outfile << std::fixed << std::setprecision(6);
+    // ↑ precision boosted for safer round-trips
+    outfile << std::fixed << std::setprecision(9);
     for (int i=0;i<N;i++) {
         auto node = BayesNet.get_nth_node(i);
         vector<string> parents = node->get_Parents();
         vector<string> values  = node->get_values();
         vector<float> cpt      = node->get_CPT();
+
+        // sanity: rows must sum to ~1
+        const int Ki = node->get_nvalues();
+        int R = 1; for (auto &pname : parents) { auto pnode = BayesNet.search_node(pname); R *= pnode->get_nvalues(); }
+        for (int r=0; r<R; ++r) {
+            double s=0.0; for (int k=0;k<Ki;++k) s += cpt[r*Ki+k];
+            if (!(std::abs(s-1.0) < 1e-5)) {
+                // normalize softly if slightly off
+                if (s>0) { double inv=1.0/s; for (int k=0;k<Ki;++k) cpt[r*Ki+k]=(float)(cpt[r*Ki+k]*inv); }
+            }
+        }
 
         outfile << "probability ( " << node->get_name();
         if (!parents.empty()) {
@@ -370,10 +385,9 @@ void initialize_cpts_complete_case(network& net, const vector<vector<string>>& d
 
 // ================== Math utils: digamma & log-sum-exp ==================
 static inline double digamma(double x) {
-    // Simple digamma approximation with recurrence + asymptotic expansion
+    // Slightly stronger approximation for small x (threshold 8.0)
     double result = 0.0;
-    // Reflect for small x if needed (x>0 assumed here; our α>0)
-    while (x < 6.0) { result -= 1.0/x; x += 1.0; }
+    while (x < 8.0) { result -= 1.0/x; x += 1.0; }
     double inv = 1.0/x;
     double inv2 = inv*inv;
     // asymptotic: psi(x) ~ log(x) - 1/(2x) - 1/(12x^2) + 1/(120x^4) - 1/(252x^6) + ...
@@ -390,11 +404,8 @@ static inline double logsumexp(const vector<double>& a) {
 
 // ================== VB helpers: E[log θ] precompute ====================
 struct VBDirichlet {
-    // Dirichlet parameters α for each node: flattened (rows * K)
-    vector<vector<double>> alpha;
-    // Cached E[log θ_k] per cell: same shape
-    vector<vector<double>> elog;
-    // Rows and K per node
+    vector<vector<double>> alpha; // Dirichlet params
+    vector<vector<double>> elog;  // E[log θ_k] cache
     vector<int> rows, K;
 
     void init_from_net(network& net, double alpha0=1.0) {
@@ -410,7 +421,6 @@ struct VBDirichlet {
         }
     }
     void set_from_counts_plus_prior(int i, const vector<double>& counts, double alpha0) {
-        // counts must be length rows*K
         alpha[i].resize(counts.size());
         for (size_t j=0;j<counts.size();++j) alpha[i][j] = alpha0 + counts[j];
     }
@@ -428,44 +438,11 @@ struct VBDirichlet {
     }
 };
 
-// Enumerate parents with product-of-marginals weights to take expectations.
-// parent_dists: for each parent j (in node.parents_idx order) a vector<double> of size radix[j]
-static void enumerate_parent_expectation(
-        const vector<int>& prads,
-        const vector<int>& pstr,
-        const vector<vector<double>>& parent_dists,
-        const vector<double>& target_row_values, // length = rows*K, but we will index row* K + fixed k
-        int K, int fixed_k,
-        double& out_sum)
-{
-    // Iterative mixed-radix enumeration
-    int P = (int)prads.size();
-    if (P==0) {
-        out_sum += target_row_values[ /*row=0*/ 0 * K + fixed_k ];
-        return;
-    }
-    vector<int> idx(P,0);
-    while (true) {
-        double w = 1.0;
-        int code = 0;
-        for (int j=0;j<P;++j) { w *= parent_dists[j][idx[j]]; code += idx[j]*pstr[j]; }
-        out_sum += w * target_row_values[ code * K + fixed_k ];
-
-        // increment
-        int j = P-1;
-        while (j>=0) {
-            idx[j]++; if (idx[j] < prads[j]) break;
-            idx[j]=0; --j;
-        }
-        if (j<0) break;
-    }
-}
-
-// Same as above, but returns a vector over all k (child values) at once.
+// ===== Enumerations (optimized “all-k”) =====
 static void enumerate_parent_expectation_allk(
         const vector<int>& prads,
         const vector<int>& pstr,
-        const vector<vector<double>>& parent_dists,
+        const vector<vector<double>>& parent_dists, // rows*K flattened in target
         const vector<double>& target_row_values, // rows*K flattened
         int K,
         vector<double>& out_sum_k)
@@ -508,14 +485,12 @@ static void build_parent_dists(network& net, int node_idx, const vector<string>&
             int a = net.fast_get(var)->vindex_fast(row[var]);
             if (a<0) { dist.assign(r, 0.0); } else { dist.assign(r, 0.0); dist[a]=1.0; }
         } else {
-            // missing parent: use q_row[var]
             const auto& qv = q_row[var];
             if (!qv.empty()) {
-                // ensure sizes match
-                vector<double> tmp = qv; tmp.resize(r, 0.0);
+                vector<double> tmp(r, 0.0);
+                for (int t=0;t<r && t<(int)qv.size();++t) tmp[t]=qv[t];
                 dist = std::move(tmp);
             } else {
-                // fallback uniform if not initialized
                 dist.assign(r, 1.0/r);
             }
         }
@@ -523,236 +498,168 @@ static void build_parent_dists(network& net, int node_idx, const vector<string>&
     }
 }
 
-// ========================== Variational Bayes ==========================
-//
-// Mean-field VB with Dirichlet posteriors for CPT rows & categorical local factors:
-//  - Global: α_{row,k} (Dirichlet) per node/parent-row/value
-//  - Local: q_r(i = k) per record r and each missing var i
-// Updates:
-//  Elogθ precomputed from α via digamma.
-//  Local q updates use Markov blanket terms expressed as expectations of Elogθ
-//  over parent distributions (product-of-marginals factorization).
-//
-// Notes:
-//  * Handles multiple "?" per row.
-//  * Uses a few local CAVI sweeps per record each global iteration.
-//  * Expected counts constructed by enumerating parent combinations.
-//
-void run_variational_bayes(network& net,
-                           const vector<vector<string>>& data,
-                           int vb_iters = 8,
-                           int local_sweeps = 2,
-                           double alpha0 = 1.0)
-{
-    const int N = net.netSize();
-    const int D = (int)data.size();
+// ===== Child term fast path: exclude overridden parent and reuse base codes =====
+static void child_contrib_excluding_parent(
+    const vector<int>& prads,            // child's parent radices
+    const vector<int>& pstr,             // child's parent strides
+    int exclude_pos,                     // position of i in child's parents
+    const vector<vector<double>>& parent_dists_noi, // distributions for all parents except i (in order)
+    const vector<double>& elog_child,    // child's elog rows*K
+    int Ki_parent,                       // cardinality of parent i
+    int Kc,                              // child's K
+    vector<vector<double>>& out_logq_add // size Ki_parent x (accumulator scalar per v); here we just add a scalar per v later
+) {
+    // Build helper arrays: prads/pstr without the excluded dimension
+    const int P = (int)prads.size();
+    vector<int> prads2; prads2.reserve(max(0,P-1));
+    vector<int> pstr2;  pstr2.reserve(max(0,P-1));
+    for (int j=0;j<P;++j) if (j!=exclude_pos) { prads2.push_back(prads[j]); pstr2.push_back(pstr[j]); }
 
-    // --- Build VB state ---
-    VBDirichlet vb;
-    vb.init_from_net(net, alpha0);
+    // stride associated with excluded parent:
+    int stride_ex = pstr[exclude_pos];
 
-    // --- Initialize α by complete-case counts + α0 ---
-    // Build temporary real-valued counts via complete cases only.
-    vector<vector<double>> cc_counts(N);
-    for (int i=0;i<N;++i) {
-        auto node = net.fast_get(i);
-        int K = node->get_nvalues();
-        long long prod=1; for (int r : node->parent_rad()) { if (r<=0 || prod>(LLONG_MAX/r)) throw runtime_error("Parent combos too large"); prod*=r; }
-        cc_counts[i].assign((int)prod * K, 0.0);
+    // Enumerate codes for the remaining parents only
+    vector<int> idx(prads2.size(), 0);
+    while (true) {
+        double w = 1.0; int code_base = 0;
+        int j2 = 0;
+        for (int j=0;j<P;++j) {
+            if (j==exclude_pos) continue;
+            w *= parent_dists_noi[j2][idx[j2]];
+            code_base += idx[j2] * pstr2[j2];
+            ++j2;
+        }
+
+        // For each possible value v of the excluded parent, shift by v*stride_ex
+        for (int v=0; v<Ki_parent; ++v) {
+            int code = code_base + v * stride_ex;
+            int base = code * Kc;
+            double acc = 0.0;
+            // Sum over child's k (we add expectation for fixed observed y or sum with q_c later)
+            // Here we only precompute the weighted elog entries. Caller decides how to combine.
+            // To keep general, we accumulate vector<Kc> per v, but to save memory we will
+            // let caller request directly per y or dot with q_c.
+            // For flexibility, we store the whole row contribution for all k:
+            // However, to keep memory small we just push the base offset; caller reads from elog_child.
+            // We therefore store nothing here; instead provide helper overloads below.
+            (void)acc;
+        }
+
+        // increment enumeration
+        int jj = (int)prads2.size()-1;
+        while (jj>=0) { idx[jj]++; if (idx[jj] < prads2[jj]) break; idx[jj]=0; --jj; }
+        if (jj<0) break;
     }
-    for (const auto& row : data) {
-        if ((int)row.size()!=N) continue;
-        bool ok_all_parents=true;
-        for (int i=0;i<N;++i) {
-            auto node = net.fast_get(i);
-            const string& tok = row[i];
-            if (tok=="?") { ok_all_parents=false; continue; }
-            int x = node->vindex_fast(tok); if (x<0) { ok_all_parents=false; continue; }
-            int code = parent_code_fast(net, *node, row);
-            if (code<0) { ok_all_parents=false; continue; }
-            int base = node->row_base_from_assign_code(code);
-            cc_counts[i][base+x] += 1.0;
+    // NOTE: We provided a framework but to avoid extra allocations, we implement two specialized
+    // helpers below that directly add contributions to logq[v] for observed or missing child.
+}
+
+// Specialized helper: observed child value y
+static void add_child_observed_fast(
+    const vector<int>& prads, const vector<int>& pstr,
+    int exclude_pos,
+    const vector<vector<double>>& parent_dists_noi,
+    const vector<double>& elog_child,
+    int Ki_parent, int Kc, int y,
+    vector<double>& logq  // size Ki_parent; add in-place
+) {
+    const int P = (int)prads.size();
+    vector<int> prads2; prads2.reserve(max(0,P-1));
+    vector<int> pstr2;  pstr2.reserve(max(0,P-1));
+    for (int j=0;j<P;++j) if (j!=exclude_pos) { prads2.push_back(prads[j]); pstr2.push_back(pstr[j]); }
+
+    int stride_ex = pstr[exclude_pos];
+
+    vector<int> idx(prads2.size(), 0);
+    while (true) {
+        double w = 1.0; int code_base = 0;
+        int j2 = 0;
+        for (int j=0;j<P;++j) {
+            if (j==exclude_pos) continue;
+            w *= parent_dists_noi[j2][idx[j2]];
+            code_base += idx[j2] * pstr2[j2];
+            ++j2;
         }
-        (void)ok_all_parents;
+        for (int v=0; v<Ki_parent; ++v) {
+            int code = code_base + v * stride_ex;
+            int base = code * Kc;
+            logq[v] += w * elog_child[base + y];
+        }
+        int jj = (int)prads2.size()-1;
+        while (jj>=0) { idx[jj]++; if (idx[jj] < prads2[jj]) break; idx[jj]=0; --jj; }
+        if (jj<0) break;
     }
-    for (int i=0;i<N;++i) vb.set_from_counts_plus_prior(i, cc_counts[i], alpha0);
+}
 
-    // --- Local variational distributions q for missing variables ---
-    // For each record r, q_r is vector size N; q_r[i] empty => observed, else length card(X_i)
-    vector<vector<vector<double>>> q(D, vector<vector<double>>(N));
-    // Initialize q uniformly (or parent-mode if easy)
-    for (int r=0;r<D;++r) {
-        if ((int)data[r].size()!=N) continue;
-        for (int i=0;i<N;++i) {
-            if (data[r][i] == "?") {
-                int K = net.fast_get(i)->get_nvalues();
-                q[r][i].assign(K, 1.0/K);
-            }
+// Specialized helper: missing child with q_c distribution
+static void add_child_missing_fast(
+    const vector<int>& prads, const vector<int>& pstr,
+    int exclude_pos,
+    const vector<vector<double>>& parent_dists_noi,
+    const vector<double>& elog_child,
+    int Ki_parent, int Kc, const vector<double>& qc,
+    vector<double>& logq // size Ki_parent; add in-place
+) {
+    const int P = (int)prads.size();
+    vector<int> prads2; prads2.reserve(max(0,P-1));
+    vector<int> pstr2;  pstr2.reserve(max(0,P-1));
+    for (int j=0;j<P;++j) if (j!=exclude_pos) { prads2.push_back(prads[j]); pstr2.push_back(pstr[j]); }
+
+    int stride_ex = pstr[exclude_pos];
+
+    vector<int> idx(prads2.size(), 0);
+    while (true) {
+        double w = 1.0; int code_base = 0;
+        int j2 = 0;
+        for (int j=0;j<P;++j) {
+            if (j==exclude_pos) continue;
+            w *= parent_dists_noi[j2][idx[j2]];
+            code_base += idx[j2] * pstr2[j2];
+            ++j2;
         }
+        for (int v=0; v<Ki_parent; ++v) {
+            int code = code_base + v * stride_ex;
+            int base = code * Kc;
+            double contrib = 0.0;
+            for (int y=0;y<Kc;++y) contrib += qc[y] * elog_child[base + y];
+            logq[v] += w * contrib;
+        }
+        int jj = (int)prads2.size()-1;
+        while (jj>=0) { idx[jj]++; if (idx[jj] < prads2[jj]) break; idx[jj]=0; --jj; }
+        if (jj<0) break;
     }
+}
 
-    // --- VB iterations ---
-    for (int it=0; it<vb_iters; ++it) {
-        // 1) Precompute Elogθ from α
-        vb.update_elog();
-
-        // 2) Local CAVI: update q_r(i) for each missing variable
-        for (int r=0;r<D;++r) {
-            const auto& row = data[r];
-            if ((int)row.size()!=N) continue;
-
-            // collect indices of missing vars in this row
-            vector<int> miss;
-            for (int i=0;i<N;++i) if (row[i] == "?") miss.push_back(i);
-            if (miss.empty()) continue;
-
-            for (int sweep=0; sweep<local_sweeps; ++sweep) {
-                for (int i_idx=0; i_idx<(int)miss.size(); ++i_idx) {
-                    int i = miss[i_idx];
-                    auto node = net.fast_get(i);
-                    int Ki = node->get_nvalues();
-
-                    // Build parent distributions for node i for each v (we enforce i=v via override)
-                    // Compute contributions:
-                    //   log q_i(v) ∝ E[log P(X_i=v | Pa_i)] + Σ_c E[log P(X_c | Pa_c)]
-                    vector<double> logq(Ki, 0.0);
-
-                    // Parent expectations contribution for node i
-                    {
-                        // For each v, expectation over parents (excluding i) of Elogθ_i(row,v)
-                        vector<vector<double>> parent_dists;
-                        const auto& PRad = node->parent_rad();
-                        const auto& PStr = node->parent_str();
-                        for (int v=0; v<Ki; ++v) {
-                            build_parent_dists(net, i, row, q[r], /*override*/ -1, -1, parent_dists);
-                            double sum = 0.0;
-                            enumerate_parent_expectation(
-                                PRad, PStr, parent_dists, vb.elog[i], Ki, /*fixed_k=*/v, sum
-                            );
-                            logq[v] += sum;
-                        }
-                    }
-
-                    // Children contributions
-                    for (int ci : node->get_children()) {
-                        auto child = net.fast_get(ci);
-                        int Kc = child->get_nvalues();
-
-                        // Prepare child's parent structures
-                        const auto& PRadC = child->parent_rad();
-                        const auto& PStrC = child->parent_str();
-
-                        if (data[r][ci] != "?") {
-                            // observed child value
-                            int y = child->vindex_fast(data[r][ci]);
-                            if (y >= 0) {
-                                for (int v=0; v<Ki; ++v) {
-                                    vector<vector<double>> parent_dists;
-                                    build_parent_dists(net, ci, row, q[r], /*override_idx=*/i, /*override_val=*/v, parent_dists);
-                                    double sum = 0.0;
-                                    enumerate_parent_expectation(
-                                        PRadC, PStrC, parent_dists, vb.elog[ci], Kc, /*fixed_k=*/y, sum
-                                    );
-                                    logq[v] += sum;
-                                }
-                            }
-                        } else {
-                            // child missing: expectation over child q
-                            const auto& qc = q[r][ci]; // size Kc
-                            if (!qc.empty()) {
-                                for (int v=0; v<Ki; ++v) {
-                                    vector<vector<double>> parent_dists;
-                                    build_parent_dists(net, ci, row, q[r], /*override_idx=*/i, /*override_val=*/v, parent_dists);
-                                    vector<double> sum_k(Kc, 0.0);
-                                    enumerate_parent_expectation_allk(
-                                        PRadC, PStrC, parent_dists, vb.elog[ci], Kc, sum_k
-                                    );
-                                    double contrib = 0.0;
-                                    for (int y=0;y<Kc;++y) contrib += qc[y] * sum_k[y];
-                                    logq[v] += contrib;
-                                }
-                            }
-                        }
-                    }
-
-                    // Normalize logq -> q
-                    double lse = logsumexp(logq);
-                    for (int v=0; v<Ki; ++v) q[r][i][v] = std::exp(logq[v] - lse);
-                }
+// Build parent distributions for a child excluding a specific parent (i)
+static void build_parent_dists_excluding_one(
+    network& net, int child_idx, const vector<string>& row,
+    const vector<vector<double>>& q_row,
+    int exclude_var_idx, // global var index to exclude
+    vector<vector<double>>& parent_dists_noi,
+    int& exclude_pos_out
+){
+    auto child = net.fast_get(child_idx);
+    const auto& PIdx = child->parents_idx();
+    const auto& PRad = child->parent_rad();
+    parent_dists_noi.clear(); parent_dists_noi.reserve(PIdx.size()>0 ? PIdx.size()-1 : 0);
+    exclude_pos_out = -1;
+    for (int p=0;p<(int)PIdx.size();++p) {
+        int var = PIdx[p];
+        if (var == exclude_var_idx) { exclude_pos_out = p; continue; }
+        int r = PRad[p];
+        vector<double> dist(r, 0.0);
+        if (row[var] != "?") {
+            int a = net.fast_get(var)->vindex_fast(row[var]);
+            if (a<0) { dist.assign(r, 0.0); } else { dist[a]=1.0; }
+        } else {
+            const auto& qv = q_row[var];
+            if (!qv.empty()) {
+                for (int t=0;t<r && t<(int)qv.size();++t) dist[t]=qv[t];
+            } else {
+                for (int t=0;t<r;++t) dist[t] = 1.0/r;
             }
         }
-
-        // 3) Global expected counts under current q: update α = α0 + E[counts]
-        for (int i=0;i<N;++i) {
-            auto node = net.fast_get(i);
-            int Ki = node->get_nvalues();
-            long long prod=1; for (int r : node->parent_rad()) prod *= r;
-            vector<double> exp_counts((int)prod * Ki, 0.0);
-
-            // For each record
-            for (int r=0;r<D;++r) {
-                const auto& row = data[r]; if ((int)row.size()!=N) continue;
-
-                // Distribution over child value
-                vector<double> child_dist(Ki, 0.0);
-                if (row[i] != "?") {
-                    int x = node->vindex_fast(row[i]);
-                    if (x<0) continue;
-                    child_dist.assign(Ki, 0.0); child_dist[x] = 1.0;
-                } else {
-                    const auto& qi = q[r][i];
-                    if (qi.empty()) { child_dist.assign(Ki, 1.0/Ki); }
-                    else { child_dist = qi; }
-                }
-
-                // Parent distributions (product-of-marginals)
-                vector<vector<double>> parent_dists;
-                build_parent_dists(net, i, row, q[r], /*override*/ -1, -1, parent_dists);
-
-                // Enumerate parent combinations and distribute child mass to counts
-                const auto& PRad = node->parent_rad();
-                const auto& PStr = node->parent_str();
-                int P = (int)PRad.size();
-                if (P==0) {
-                    int base = 0;
-                    for (int k=0;k<Ki;++k) exp_counts[base + k] += child_dist[k];
-                } else {
-                    vector<int> idx(P,0);
-                    while (true) {
-                        double w = 1.0; int code = 0;
-                        for (int j=0;j<P;++j) { w *= parent_dists[j][idx[j]]; code += idx[j]*PStr[j]; }
-                        int base = code * Ki;
-                        for (int k=0;k<Ki;++k) exp_counts[base+k] += w * child_dist[k];
-
-                        int j=P-1;
-                        while (j>=0) { idx[j]++; if (idx[j] < PRad[j]) break; idx[j]=0; --j; }
-                        if (j<0) break;
-                    }
-                }
-            }
-
-            // Set α_i ← α0 + E[counts]
-            vb.set_from_counts_plus_prior(i, exp_counts, alpha0);
-        }
-
-        // 4) Update CPTs to posterior means for export/use: E[θ] = α / sum α per row
-        for (int i=0;i<N;++i) {
-            auto node = net.fast_get(i);
-            int Ki = node->get_nvalues();
-            int R  = vb.rows[i];
-            vector<float> cpt(R*Ki, 0.0f);
-            for (int rrow=0;rrow<R;++rrow) {
-                double sum = 0.0; for (int k=0;k<Ki;++k) sum += vb.alpha[i][rrow*Ki+k];
-                if (sum <= 0.0) {
-                    for (int k=0;k<Ki;++k) cpt[rrow*Ki+k] = 1.0f / Ki;
-                } else {
-                    for (int k=0;k<Ki;++k) cpt[rrow*Ki+k] = (float)(vb.alpha[i][rrow*Ki+k] / sum);
-                }
-            }
-            node->set_CPT(cpt);
-        }
-
-        cout << "VB iteration " << (it+1) << " complete." << endl;
+        parent_dists_noi.push_back(std::move(dist));
     }
 }
 
@@ -817,7 +724,367 @@ void validate_dataset(network& net, const vector<vector<string>>& data, int max_
     cerr << "Validation summary: bad_rows="<<bad_rows<<" bad_tokens="<<bad_tokens<<" multi_missing="<<missing_multi<<"\n";
 }
 
-#ifndef BN_LIB
+// ====================== ELBO helpers (Dirichlet) ======================
+static inline double log_gamma(double x){ return std::lgamma(x); }
+
+static double log_B(const vector<double>& a, int off, int K) {
+    double sum = 0.0; for (int k=0;k<K;++k) sum += a[off+k];
+    double v = log_gamma(sum);
+    for (int k=0;k<K;++k) v -= log_gamma(a[off+k]);
+    return v;
+}
+
+static double dirichlet_entropy(const vector<double>& a, int off, int K) {
+    double a0 = 0.0; for (int k=0;k<K;++k) a0 += a[off+k];
+    double H = log_B(a, off, K);
+    H += (a0 - K) * digamma(a0);
+    for (int k=0;k<K;++k) H -= (a[off+k]-1.0) * digamma(a[off+k]);
+    return H;
+}
+
+// Compute (expected) counts like in the global step (for ELBO and diagnostics)
+static void expected_counts_for_node(
+    network& net, int i, const vector<vector<string>>& data,
+    const vector<vector<vector<double>>>& q,
+    vector<double>& exp_counts // out: rows*Ki
+) {
+    auto node = net.fast_get(i);
+    int Ki = node->get_nvalues();
+    long long prod=1; for (int r : node->parent_rad()) prod *= r;
+    exp_counts.assign((int)prod * Ki, 0.0);
+
+    const auto& PRad = node->parent_rad();
+    const auto& PStr = node->parent_str();
+
+    const int D = (int)data.size();
+    for (int r=0;r<D;++r) {
+        const auto& row = data[r]; if ((int)row.size()!=net.netSize()) continue;
+
+        vector<double> child_dist(Ki, 0.0);
+        if (row[i] != "?") {
+            int x = node->vindex_fast(row[i]); if (x<0) continue;
+            child_dist[x] = 1.0;
+        } else {
+            const auto& qi = q[r][i];
+            if (qi.empty()) { for (int k=0;k<Ki;++k) child_dist[k] = 1.0/Ki; }
+            else child_dist = qi;
+        }
+
+        vector<vector<double>> parent_dists;
+        build_parent_dists(net, i, row, q[r], -1, -1, parent_dists);
+
+        int P = (int)PRad.size();
+        if (P==0) {
+            int base = 0; for (int k=0;k<Ki;++k) exp_counts[base+k] += child_dist[k];
+        } else {
+            vector<int> idx(P,0);
+            while (true) {
+                double w = 1.0; int code = 0;
+                for (int j=0;j<P;++j) { w *= parent_dists[j][idx[j]]; code += idx[j]*PStr[j]; }
+                int base = code * Ki;
+                for (int k=0;k<Ki;++k) exp_counts[base+k] += w * child_dist[k];
+
+                int jj=P-1;
+                while (jj>=0) { idx[jj]++; if (idx[jj] < PRad[jj]) break; idx[jj]=0; --jj; }
+                if (jj<0) break;
+            }
+        }
+    }
+}
+
+// Full ELBO (prior + expected log-likelihood − post + entropy(q_Z))
+static double compute_ELBO(
+    network& net,
+    const VBDirichlet& vb,
+    const vector<vector<string>>& data,
+    const vector<vector<vector<double>>>& q,
+    double alpha0
+){
+    const int N = net.netSize();
+    double elbo = 0.0;
+
+    // 1) Expected log p(theta | alpha0) and -E[log q(theta)] = + H[Dir]
+    for (int i=0;i<N;++i) {
+        int Ki = vb.K[i];
+        int R = vb.rows[i];
+        const auto& a  = vb.alpha[i];
+        const auto& el = vb.elog[i];
+        for (int r=0;r<R;++r) {
+            int off = r*Ki;
+
+            // prior term: -logB(alpha0 1) + sum_k (alpha0-1) E[log theta_k]
+            double logB0 = log_gamma(alpha0 * Ki) - Ki * log_gamma(alpha0);
+            double prior = -logB0;
+            for (int k=0;k<Ki;++k) prior += (alpha0 - 1.0) * el[off + k];
+            elbo += prior;
+
+            // + entropy of posterior q(theta)
+            elbo += dirichlet_entropy(a, off, Ki);
+        }
+    }
+
+    // 2) Expected log p(X | theta)  == sum_{i,rows,k} E[counts] * elog
+    for (int i=0;i<N;++i) {
+        vector<double> exp_counts; expected_counts_for_node(net, i, data, q, exp_counts);
+        const auto& el = vb.elog[i];
+        for (size_t j=0;j<exp_counts.size();++j) elbo += exp_counts[j] * el[j];
+    }
+
+    // 3) −E[log q(Z)]  == sum entropies of local categorical qs
+    double Hz = 0.0;
+    const int D = (int)data.size();
+    for (int r=0;r<D;++r) {
+        if ((int)data[r].size()!=N) continue;
+        for (int i=0;i<N;++i) if (data[r][i] == "?") {
+            const auto& qi = q[r][i];
+            for (double v : qi) if (v>0) Hz += - v * std::log(std::max(v, 1e-300));
+        }
+    }
+    elbo += Hz;
+
+    return elbo;
+}
+
+// ========================== Variational Bayes ==========================
+//
+// Added:
+//  - Damping for local q (lambda_damp)
+//  - Early stopping via ELBO with best checkpointing
+//  - Reuse parent_dists + all-k enumeration
+//
+struct VBOptions {
+    int vb_iters = 12;
+    int local_sweeps = 2;
+    double alpha0 = 1.0;
+    double lambda_damp = 1.0;   // (0,1] ; e.g., 0.5 = 50% damping, 1=no damping
+    double elbo_tol = 1e-4;     // relative improvement threshold
+    int elbo_patience = 3;      // stop if no improvement this many iterations
+    bool verbose = true;
+};
+
+void run_variational_bayes(network& net,
+                           const vector<vector<string>>& data,
+                           const VBOptions& opt = VBOptions())
+{
+    const int N = net.netSize();
+    const int D = (int)data.size();
+
+    // --- Build VB state ---
+    VBDirichlet vb;
+    vb.init_from_net(net, opt.alpha0);
+
+    // --- Initialize α by complete-case counts + α0 ---
+    vector<vector<double>> cc_counts(N);
+    for (int i=0;i<N;++i) {
+        auto node = net.fast_get(i);
+        int K = node->get_nvalues();
+        long long prod=1; for (int r : node->parent_rad()) { if (r<=0 || prod>(LLONG_MAX/r)) throw runtime_error("Parent combos too large"); prod*=r; }
+        cc_counts[i].assign((int)prod * K, 0.0);
+    }
+    for (const auto& row : data) {
+        if ((int)row.size()!=N) continue;
+        for (int i=0;i<N;++i) {
+            auto node = net.fast_get(i);
+            const string& tok = row[i];
+            if (tok=="?") continue;
+            int x = node->vindex_fast(tok); if (x<0) continue;
+            int code = parent_code_fast(net, *node, row);
+            if (code<0) continue;
+            int base = node->row_base_from_assign_code(code);
+            cc_counts[i][base+x] += 1.0;
+        }
+    }
+    for (int i=0;i<N;++i) vb.set_from_counts_plus_prior(i, cc_counts[i], opt.alpha0);
+
+    // --- Local variational distributions q for missing variables ---
+    vector<vector<vector<double>>> q(D, vector<vector<double>>(N));
+    for (int r=0;r<D;++r) {
+        if ((int)data[r].size()!=N) continue;
+        for (int i=0;i<N;++i) {
+            if (data[r][i] == "?") {
+                int K = net.fast_get(i)->get_nvalues();
+                q[r][i].assign(K, 1.0/K);
+            }
+        }
+    }
+
+    // Best checkpoint
+    vector<vector<float>> best_CPTs(N);
+    double best_elbo = -std::numeric_limits<double>::infinity();
+    int no_improve = 0;
+
+    // --- VB iterations ---
+    for (int it=0; it<opt.vb_iters; ++it) {
+        // 1) Precompute Elogθ from α
+        vb.update_elog();
+
+        // 2) Local CAVI: update q_r(i) for each missing variable
+        //    (with damping + safer normalization; reusing parent dists)
+        // #pragma omp parallel for schedule(static) if (D>2000)
+        for (int r=0;r<D;++r) {
+            const auto& row = data[r];
+            if ((int)row.size()!=N) continue;
+
+            vector<int> miss;
+            for (int i=0;i<N;++i) if (row[i] == "?") miss.push_back(i);
+            if (miss.empty()) continue;
+
+            for (int sweep=0; sweep<opt.local_sweeps; ++sweep) {
+                for (int i_idx=0; i_idx<(int)miss.size(); ++i_idx) {
+                    int i = miss[i_idx];
+                    auto node = net.fast_get(i);
+                    int Ki = node->get_nvalues();
+
+                    vector<double> logq(Ki, 0.0);
+
+                    // ---- Parent expectations contribution for node i (single enumeration for all k)
+                    vector<vector<double>> parent_dists_i;
+                    build_parent_dists(net, i, row, q[r], /*override*/ -1, -1, parent_dists_i);
+                    const auto& PRad_i = node->parent_rad();
+                    const auto& PStr_i = node->parent_str();
+                    vector<double> sum_k(Ki, 0.0);
+                    enumerate_parent_expectation_allk(PRad_i, PStr_i, parent_dists_i, vb.elog[i], Ki, sum_k);
+                    for (int v=0; v<Ki; ++v) logq[v] += sum_k[v];
+
+                    // ---- Children contributions (fast: exclude i from child's parents)
+                    for (int ci : node->get_children()) {
+                        auto child = net.fast_get(ci);
+                        int Kc = child->get_nvalues();
+
+                        // locate i in child's parents
+                        const auto& PIdxC = child->parents_idx();
+                        const auto& PRadC = child->parent_rad();
+                        const auto& PStrC = child->parent_str();
+                        int pos_i = -1; for (int p=0;p<(int)PIdxC.size();++p) if (PIdxC[p]==i) { pos_i=p; break; }
+                        if (pos_i == -1) continue; // should not happen
+
+                        vector<vector<double>> parent_dists_noi;
+                        build_parent_dists_excluding_one(net, ci, row, q[r], /*exclude*/ i, parent_dists_noi, pos_i);
+
+                        if (data[r][ci] != "?") {
+                            int y = child->vindex_fast(data[r][ci]);
+                            if (y >= 0) {
+                                add_child_observed_fast(PRadC, PStrC, pos_i, parent_dists_noi, vb.elog[ci], Ki, Kc, y, logq);
+                            }
+                        } else {
+                            const auto& qc = q[r][ci];
+                            if (!qc.empty()) {
+                                add_child_missing_fast(PRadC, PStrC, pos_i, parent_dists_noi, vb.elog[ci], Ki, Kc, qc, logq);
+                            }
+                        }
+                    }
+
+                    // ---- Normalize logq -> q with fallback + damping
+                    double lse = logsumexp(logq);
+                    vector<double> q_new(Ki, 1.0/Ki);
+                    if (std::isfinite(lse)) {
+                        for (int v=0; v<Ki; ++v) q_new[v] = std::exp(logq[v] - lse);
+                    }
+                    if (opt.lambda_damp < 1.0) {
+                        for (int v=0; v<Ki; ++v)
+                            q[r][i][v] = (1.0 - opt.lambda_damp) * q[r][i][v] + opt.lambda_damp * q_new[v];
+                    } else {
+                        q[r][i] = std::move(q_new);
+                    }
+                }
+            }
+        }
+
+        // 3) Global expected counts under current q: update α = α0 + E[counts]
+        #pragma omp parallel for schedule(static) if (N>2)
+        for (int i=0;i<N;++i) {
+            auto node = net.fast_get(i);
+            int Ki = node->get_nvalues();
+            long long prod=1; for (int r : node->parent_rad()) prod *= r;
+            vector<double> exp_counts((int)prod * Ki, 0.0);
+
+            const int Dloc = (int)data.size();
+            const auto& PRad = node->parent_rad();
+            const auto& PStr = node->parent_str();
+            int P = (int)PRad.size();
+
+            // We use thread-local exp_counts then (implicitly) write back (no race; i is private in loop)
+            for (int r=0;r<Dloc;++r) {
+                const auto& row = data[r]; if ((int)row.size()!=N) continue;
+
+                vector<double> child_dist(Ki, 0.0);
+                if (row[i] != "?") {
+                    int x = node->vindex_fast(row[i]);
+                    if (x<0) continue;
+                    child_dist[x] = 1.0;
+                } else {
+                    const auto& qi = q[r][i];
+                    if (qi.empty()) { for (int k=0;k<Ki;++k) child_dist[k] = 1.0/Ki; }
+                    else { child_dist = qi; }
+                }
+
+                vector<vector<double>> parent_dists;
+                build_parent_dists(net, i, row, q[r], /*override*/ -1, -1, parent_dists);
+
+                if (P==0) {
+                    int base = 0;
+                    for (int k=0;k<Ki;++k) exp_counts[base + k] += child_dist[k];
+                } else {
+                    vector<int> idx(P,0);
+                    while (true) {
+                        double w = 1.0; int code = 0;
+                        for (int j=0;j<P;++j) { w *= parent_dists[j][idx[j]]; code += idx[j]*PStr[j]; }
+                        int base = code * Ki;
+                        for (int k=0;k<Ki;++k) exp_counts[base+k] += w * child_dist[k];
+
+                        int j=P-1;
+                        while (j>=0) { idx[j]++; if (idx[j] < PRad[j]) break; idx[j]=0; --j; }
+                        if (j<0) break;
+                    }
+                }
+            }
+
+            // Set α_i ← α0 + E[counts]
+            vb.set_from_counts_plus_prior(i, exp_counts, opt.alpha0);
+        }
+
+        // 4) Update CPTs to posterior means for export/use: E[θ] = α / sum α per row
+        for (int i=0;i<N;++i) {
+            auto node = net.fast_get(i);
+            int Ki = node->get_nvalues();
+            int R  = vb.rows[i];
+            vector<float> cpt(R*Ki, 0.0f);
+            for (int rrow=0;rrow<R;++rrow) {
+                double sum = 0.0; for (int k=0;k<Ki;++k) sum += vb.alpha[i][rrow*Ki+k];
+                if (sum <= 0.0) {
+                    for (int k=0;k<Ki;++k) cpt[rrow*Ki+k] = 1.0f / Ki;
+                } else {
+                    for (int k=0;k<Ki;++k) cpt[rrow*Ki+k] = (float)(vb.alpha[i][rrow*Ki+k] / sum);
+                }
+            }
+            node->set_CPT(cpt);
+        }
+
+        // 5) ELBO + early stopping
+        double elbo = compute_ELBO(net, vb, data, q, opt.alpha0);
+        if (opt.verbose) cout << "VB iter " << (it+1) << "  ELBO=" << std::setprecision(10) << elbo << endl;
+
+        if (elbo > best_elbo + std::abs(best_elbo)*opt.elbo_tol) {
+            best_elbo = elbo;
+            no_improve = 0;
+            // checkpoint CPTs
+            for (int i=0;i<N;++i) best_CPTs[i] = net.fast_get(i)->get_CPT();
+        } else {
+            no_improve++;
+            if (no_improve >= opt.elbo_patience) {
+                if (opt.verbose) cerr << "Early stopping (no ELBO improvement " << opt.elbo_patience << " iters).\n";
+                break;
+            }
+        }
+    }
+
+    // Restore best CPTs if early stopped before last
+    if (best_elbo > -std::numeric_limits<double>::infinity()) {
+        for (int i=0;i<N;++i) net.fast_get(i)->set_CPT(best_CPTs[i]);
+    }
+}
+
+// #ifndef BN_LIB
 int main() {
     network BayesNet = read_network("hailfinder.bif");
     vector<vector<string>> dataset = load_records_csv("records.dat");
@@ -829,16 +1096,18 @@ int main() {
     initialize_cpts_complete_case(BayesNet, dataset);
 
     // === Variational Bayes (mean-field) ===
-    run_variational_bayes(BayesNet, dataset,
-                          /*vb_iters=*/8,
-                          /*local_sweeps=*/2,
-                          /*alpha0=*/1.0);
+    VBOptions opt;
+    opt.vb_iters = 50;        // allow more iters; early-stopping will cut it
+    opt.local_sweeps = 2;
+    opt.alpha0 = 1.0;         // tune if needed (0.5–5 often good)
+    opt.lambda_damp = 0.7;    // damping helps stability
+    opt.elbo_tol = 1e-8;
+    opt.elbo_patience = 5;
+    opt.verbose = true;
 
-    // If you want to try alternatives:
-    // run_soft_em(BayesNet, dataset, /*iters=*/7);                         // (kept earlier in your project)
-    // run_multiple_imputation_em(BayesNet, dataset, 6, 5, 1, 1, 1e-3f);    // (kept earlier in your project)
+    run_variational_bayes(BayesNet, dataset, opt);
 
     write_network("solved.bif", BayesNet);
     return 0;
 }
-#endif // BN_LIB
+// #endif // BN_LIB

@@ -877,7 +877,7 @@ int main() {
     // 2) Multiple-Imputation EM (recommended when rows have multiple '?'):
     run_multiple_imputation_em(BayesNet, dataset,
                                /*em_iters=*/6,
-                               /*M=*/5,
+                               /*M=*/100,
                                /*burnin=*/1,
                                /*sweeps=*/1,
                                /*pseudo=*/1e-3f);

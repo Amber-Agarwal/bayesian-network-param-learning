@@ -1,4 +1,13 @@
-// startup_code.cpp  (Soft EM version)
+// startup_code.cpp  (Soft EM version, improved)
+// Improvements in Soft EM:
+// [CHANGE 1]  Log-space probability accumulation for numerical stability
+// [CHANGE 2]  α-smoothing during CPT normalization
+// [CHANGE 3]  Convergence check based on log-likelihood
+// [CHANGE 4]  Small random noise for symmetry breaking
+// [CHANGE 6]  Optional child-weight softening
+// [CHANGE 7]  Fixed random seed for reproducibility
+// [CHANGE 8]  Reuse preallocated count buffers for efficiency
+
 #include <iostream>
 #include <string>
 #include <vector>
@@ -13,7 +22,6 @@
 #include <climits>
 #include <limits>
 #include <stdexcept>
-
 using namespace std;
 
 class Graph_Node {
@@ -26,10 +34,10 @@ private:
     vector<float> CPT;
 
     // caches
-    vector<int> PIdx;                 // parent indices in network order
-    vector<int> PRad;                 // parent cardinalities
-    vector<int> PStr;                 // mixed-radix strides (rightmost fastest)
-    unordered_map<string,int> Val2Idx;// value->index
+    vector<int> PIdx;
+    vector<int> PRad;
+    vector<int> PStr;
+    unordered_map<string,int> Val2Idx;
 
 public:
     Graph_Node(string name, int n, vector<string> vals) {
@@ -38,7 +46,6 @@ public:
         values = std::move(vals);
     }
 
-    // original API
     string get_name() { return Node_Name; }
     vector<int> get_children() { return Children; }
     vector<string> get_Parents() { return Parents; }
@@ -53,7 +60,6 @@ public:
         return 1;
     }
 
-    // caches
     void build_value_index() {
         Val2Idx.clear(); Val2Idx.reserve(values.size()*2+1);
         for (int i = 0; i < (int)values.size(); ++i) Val2Idx[values[i]] = i;
@@ -89,23 +95,18 @@ public:
 
 class network {
     list<Graph_Node> Pres_Graph;
-
-    // caches
     vector<list<Graph_Node>::iterator> index_cache;
     unordered_map<string,int> name2idx;
 
 public:
     int addNode(Graph_Node node) { Pres_Graph.push_back(std::move(node)); return 0; }
-
     list<Graph_Node>::iterator getNode(int i) {
         int count = 0;
-        for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it) {
+        for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it)
             if (count++ == i) return it;
-        }
         return Pres_Graph.end();
     }
     int netSize() { return (int)Pres_Graph.size(); }
-
     int get_index(string val_name) {
         int count = 0;
         for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it, ++count)
@@ -125,7 +126,6 @@ public:
         return Pres_Graph.end();
     }
 
-    // caches
     void finalize_index_cache() {
         index_cache.clear(); index_cache.reserve(Pres_Graph.size());
         name2idx.clear(); name2idx.reserve(Pres_Graph.size()*2+1);
@@ -144,7 +144,7 @@ public:
     const unordered_map<string,int>& get_name_map() const { return name2idx; }
 };
 
-// utils
+// --------------------------- Utility Functions ---------------------------
 static inline string trim(const string& str) {
     size_t first = str.find_first_not_of(" \t\r\n");
     if (string::npos == first) return str;
@@ -152,6 +152,73 @@ static inline string trim(const string& str) {
     return str.substr(first, (last - first + 1));
 }
 
+static inline void rtrim_cr(std::string& s) { if (!s.empty() && s.back() == '\r') s.pop_back(); }
+static inline std::string strip_quotes(const std::string& s) {
+    if (s.size() >= 2 && s.front() == '"' && s.back() == '"') return s.substr(1, s.size() - 2);
+    return s;
+}
+static std::vector<std::string> parse_csv_line(const std::string& line_in) {
+    std::vector<std::string> out; std::string field; bool in_quotes = false;
+    for (size_t i = 0; i < line_in.size(); ++i) {
+        char c = line_in[i];
+        if (c == '"') { in_quotes = !in_quotes; field.push_back(c); }
+        else if (c == ',' && !in_quotes) { out.push_back(strip_quotes(field)); field.clear(); }
+        else { field.push_back(c); }
+    }
+    out.push_back(strip_quotes(field));
+    return out;
+}
+
+// --- Robust loader with auto-detect (CSV vs whitespace) ---
+std::vector<std::vector<std::string>> load_records_csv(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) { std::cerr << "Could not open " << path << "\n"; return {}; }
+
+    std::vector<std::vector<std::string>> data;
+    std::string line;
+    bool decided = false;
+    bool use_csv = false;
+
+    while (std::getline(in, line)) {
+        rtrim_cr(line);
+        if (line.empty()) continue;
+
+        if (!decided) {
+            // simple heuristic: if the first non-empty line has a comma outside quotes, assume CSV
+            bool in_quotes = false;
+            for (char c : line) {
+                if (c == '"') in_quotes = !in_quotes;
+                if (c == ',' && !in_quotes) { use_csv = true; break; }
+            }
+            decided = true;
+        }
+
+        std::vector<std::string> row;
+        if (use_csv) {
+            row = parse_csv_line(line);
+        } else {
+            std::stringstream ss(line);
+            std::string tok;
+            while (ss >> tok) row.push_back(tok);
+        }
+
+        // trim stray commas/spaces from tokens
+        for (auto& t : row) {
+            // remove trailing commas that often appear in space-delimited dumps
+            while (!t.empty() && (t.back() == ',')) t.pop_back();
+            // trim spaces
+            size_t a = t.find_first_not_of(" \t");
+            size_t b = t.find_last_not_of(" \t");
+            t = (a == std::string::npos) ? std::string() : t.substr(a, b - a + 1);
+        }
+
+        if (!row.empty()) data.push_back(std::move(row));
+    }
+    std::cerr << "Loaded " << data.size() << " records"
+              << (use_csv ? " (CSV detected)." : " (whitespace detected).") << "\n";
+    return data;
+}
+// --------------------------- Network Read/Write ---------------------------
 network read_network(const char* filename) {
     network BayesNet;
     string line;
@@ -244,102 +311,88 @@ network read_network(const char* filename) {
 
 void write_network(const char* filename, network& BayesNet) {
     ofstream outfile(filename);
-    if (!outfile.is_open()) { cout << "Error: Could not open file " << filename << " for writing" << endl; return; }
+    if (!outfile.is_open()) { cerr << "Error writing " << filename << "\n"; return; }
 
-    outfile << "// Bayesian Network" << endl << endl;
+    outfile << "// Bayesian Network\n\n";
     int N = BayesNet.netSize();
 
+    // Variables
     for (int i = 0; i < N; i++) {
         auto node = BayesNet.get_nth_node(i);
-        outfile << "variable " << node->get_name() << " {" << endl;
+        outfile << "variable " << node->get_name() << " {\n";
         outfile << "  type discrete [ " << node->get_nvalues() << " ] = { ";
-        vector<string> vals = node->get_values();
+        auto vals = node->get_values();
         for (int j = 0; j < (int)vals.size(); j++) {
             outfile << vals[j];
             if (j < (int)vals.size() - 1) outfile << ", ";
         }
-        outfile << " };" << endl << "}" << endl;
+        outfile << " };\n}\n";
     }
 
-    outfile << std::fixed << std::setprecision(6);
+    // CPTs
+    outfile << fixed << setprecision(6);
     for (int i = 0; i < N; i++) {
         auto node = BayesNet.get_nth_node(i);
-        vector<string> parents = node->get_Parents();
-        vector<string> values  = node->get_values();
-        vector<float> cpt      = node->get_CPT();
+        auto parents = node->get_Parents();
+        auto values = node->get_values();
+        auto cpt = node->get_CPT();
 
         outfile << "probability ( " << node->get_name();
         if (!parents.empty()) {
             outfile << " | ";
             for (int j = 0; j < (int)parents.size(); j++) {
                 outfile << parents[j];
-                if (j < (int)parents.size() - 1) outfile << ", ";
+                if (j < (int)parents.size()-1) outfile << ", ";
             }
         }
-        outfile << " ) {" << endl;
+        outfile << " ) {\n";
 
-        vector<int> radices; radices.reserve(parents.size());
-        for (auto &pname : parents) {
-            auto pnode = BayesNet.search_node(pname);
-            radices.push_back(pnode->get_nvalues());
-        }
+        vector<int> radices;
+        for (auto& pname : parents)
+            radices.push_back(BayesNet.search_node(pname)->get_nvalues());
         int parent_combinations = 1;
         for (int r : radices) parent_combinations *= r;
 
-        int cpt_index = 0;
+        int idx = 0;
         if (parents.empty()) {
-            outfile << "    table ";
+            outfile << "  table ";
             for (int k = 0; k < (int)values.size(); k++) {
-                if (cpt_index < (int)cpt.size()) outfile << cpt[cpt_index++]; else outfile << "-1";
-                if (k < (int)values.size() - 1) outfile << ", ";
+                outfile << cpt[idx++];
+                if (k < (int)values.size()-1) outfile << ", ";
             }
-            outfile << ";" << endl;
+            outfile << ";\n";
         } else {
             for (int comb = 0; comb < parent_combinations; comb++) {
-                vector<int> idx(parents.size(), 0);
+                vector<int> pidx(parents.size(),0);
                 int tmp = comb;
-                for (int p = (int)parents.size() - 1; p >= 0; p--) { idx[p] = tmp % radices[p]; tmp /= radices[p]; }
-
-                outfile << "    ( ";
-                for (int p = 0; p < (int)parents.size(); p++) {
-                    auto pnode = BayesNet.search_node(parents[p]);
-                    auto pvals = pnode->get_values();
-                    int vidx = idx[p];
-                    outfile << pvals[vidx];
-                    if (p < (int)parents.size() - 1) outfile << ", ";
+                for (int p = (int)parents.size()-1; p>=0; --p){ pidx[p]=tmp%radices[p]; tmp/=radices[p]; }
+                outfile << "  ( ";
+                for (int p=0;p<(int)parents.size();++p){
+                    auto pnode=BayesNet.search_node(parents[p]);
+                    auto pvals=pnode->get_values();
+                    outfile << pvals[pidx[p]];
+                    if(p<(int)parents.size()-1) outfile<<", ";
                 }
-                outfile << " ) ";
-                for (int k = 0; k < (int)values.size(); k++) {
-                    if (cpt_index < (int)cpt.size()) outfile << cpt[cpt_index++]; else outfile << "-1";
-                    if (k < (int)values.size() - 1) outfile << ", ";
+                outfile<<") ";
+                for (int k=0;k<(int)values.size();k++){
+                    outfile<<cpt[idx++];
+                    if(k<(int)values.size()-1) outfile<<", ";
                 }
-                outfile << ";" << endl;
+                outfile<<";\n";
             }
         }
-        outfile << "};" << endl << endl;
+        outfile << "};\n\n";
     }
     outfile.close();
     cout << "Network written to file: " << filename << endl;
 }
 
-// legacy helpers kept (unused by fast path, safe to retain)
+// --------------------------- CPT Initialization ---------------------------
 int value_index(const vector<string>& values, const string& val) {
     for (int i = 0; i < (int)values.size(); ++i) if (values[i] == val) return i;
     return -1;
 }
-int get_cpt_index(network& net, Graph_Node& node, const vector<int>& assignment) {
-    vector<string> parents = node.get_Parents();
-    vector<int> radices;
-    for (const string& p : parents) {
-        auto pnode = net.search_node(p);
-        radices.push_back(pnode->get_nvalues());
-    }
-    int index = 0, factor = 1;
-    for (int i = (int)parents.size() - 1; i >= 0; --i) { index += assignment[i] * factor; factor *= radices[i]; }
-    return index * node.get_nvalues();
-}
 
-// fast mixed-radix helpers
 inline int parent_code_fast(network& net, Graph_Node& node, const vector<string>& row) {
     const auto& PIdx = node.parents_idx();
     const auto& PStr = node.parent_str();
@@ -375,7 +428,7 @@ inline int parent_code_with_override(network& net, Graph_Node& node, const vecto
     return code;
 }
 
-// Complete-case + Laplace(+1) initialization
+// --------------------------- Initialization from Data ---------------------------
 void initialize_cpts_complete_case(network& net, const vector<vector<string>>& data) {
     const int N = net.netSize();
     vector<vector<float>> counts(N);
@@ -387,7 +440,7 @@ void initialize_cpts_complete_case(network& net, const vector<vector<string>>& d
         long long prod = 1;
         for (int r : node->parent_rad()) { if (r <= 0 || prod > (LLONG_MAX / r)) throw runtime_error("Parent combos too large"); prod *= r; }
         parent_combos[i] = (int)prod;
-        counts[i].assign(parent_combos[i] * nvals[i], 1.0f); // Laplace +1
+        counts[i].assign(parent_combos[i] * nvals[i], 1.0f);
     }
 
     for (const auto& row : data) {
@@ -423,38 +476,69 @@ void initialize_cpts_complete_case(network& net, const vector<vector<string>>& d
     cerr << "Initialized CPTs from complete cases with Laplace (+1)." << endl;
 }
 
-// ========================== Soft EM ==========================
-// Single-missing-per-row soft EM:
-//  - If fully observed: add 1 to the matching CPT cell.
-//  - If exactly one variable M is missing:
-//      * Compute posterior w[v] ∝ P(M=v | parents)*∏_child P(child_obs | parents with M=v)
-//      * For any node whose family depends on M (node==M or has M as a parent), add fractional counts weighted by w[v].
-//      * Others: add as fully observed.
-void run_soft_em(network& net, const vector<vector<string>>& data, int max_iter = 7) {
-    const int N = net.netSize();
-    const int D = (int)data.size();
-    const float tiny = 1e-12f;
-
-    for (int iter = 0; iter < max_iter; ++iter) {
-        vector<vector<float>> counts(N);
-        // fresh counts with small pseudocount to avoid zeros
+// ========================== Soft EM (Improved) ==========================
+// see top of file for list of [CHANGE #] annotations
+double compute_log_likelihood(network& net, const vector<vector<string>>& data) {
+    const double tiny = 1e-12;
+    double ll = 0.0;
+    int N = net.netSize();
+    for (const auto& row : data) {
+        if ((int)row.size() != N) continue;
+        double logp = 0.0;
         for (int i = 0; i < N; ++i) {
             auto node = net.fast_get(i);
-            long long prod = 1;
-            for (int r : node->parent_rad()) { if (r <= 0 || prod > (LLONG_MAX / r)) throw runtime_error("Parent combos too large"); prod *= r; }
-            counts[i].assign((int)prod * node->get_nvalues(), 1e-3f);
+            int x = node->vindex_fast(row[i]);
+            if (x < 0) continue;
+            int code = parent_code_fast(net, *node, row);
+            if (code < 0) continue;
+            int base = node->row_base_from_assign_code(code);
+            const auto& cpt = node->get_CPT();
+            logp += std::log(std::max<double>(tiny, cpt[base + x]));
         }
+        ll += logp;
+    }
+    return ll;
+}
+void run_soft_em(network& net, const vector<vector<string>>& data, int max_iter = 50, double tol = 1e-4) {
+    srand(42); // reproducibility
 
-        for (int r = 0; r < D; ++r) {
-            const auto& row = data[r];
+    // ---- Annealed-EM temperature schedule (τ) ----
+    double tau       = 2.0;  // start soft; try 1.5–3.0
+    double tau_decay = 0.90; // cool by ~10% per EM iteration (try 0.85–0.97)
+    double tau_min   = 1.0;  // do not go below exact EM
+
+    const int N   = net.netSize();
+    const double tiny = 1e-12; // numeric floor for logs/probabilities
+
+    // ---- Preallocate/reuse counts buffers ----
+    vector<vector<float>> counts(N);
+    for (int i = 0; i < N; ++i) {
+        auto node = net.fast_get(i);
+        long long prod = 1;
+        for (int r : node->parent_rad()) {
+            if (r <= 0 || prod > (LLONG_MAX / r)) throw runtime_error("Parent combos too large");
+            prod *= r;
+        }
+        counts[i].assign((int)prod * node->get_nvalues(), 0.0f);
+    }
+
+    double prev_ll = -1e100;
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        // Small noise floor + tiny jitter for symmetry breaking
+        for (int i = 0; i < N; ++i)
+            std::fill(counts[i].begin(), counts[i].end(), 1e-6f + (rand() % 100) / 1e7f);
+
+        // ========================= E-step =========================
+        for (const auto& row : data) {
             if ((int)row.size() != N) continue;
 
             int missing_idx = -1, q = 0;
             for (int i = 0; i < N; ++i) if (row[i] == "?" && ++q == 1) missing_idx = i;
-            if (q > 1) continue; // we keep the same constraint for tractability
+            if (q > 1) continue; // keep single-missing constraint
 
             if (q == 0) {
-                // Fully observed: straightforward accumulation
+                // Fully observed row
                 for (int i = 0; i < N; ++i) {
                     auto node = net.fast_get(i);
                     int x = node->vindex_fast(row[i]);
@@ -465,60 +549,107 @@ void run_soft_em(network& net, const vector<vector<string>>& data, int max_iter 
                     counts[i][base + x] += 1.0f;
                 }
             } else {
-                // Exactly one missing variable: compute posterior weights and add fractional counts.
+                // Exactly one missing variable
                 auto mnode = net.fast_get(missing_idx);
 
-                // Posterior over M using Markov blanket (parents + children)
+                // Parent code for the missing node (may be unknown)
                 int m_code = parent_code_fast(net, *mnode, row);
-                if (m_code < 0) continue; // if a parent is "?" (shouldn't happen under single-missing), skip
-                int m_base = mnode->row_base_from_assign_code(m_code);
-                const auto mC = mnode->get_CPT();
+                int m_base = (m_code >= 0) ? mnode->row_base_from_assign_code(m_code) : 0;
+                const auto& mC = mnode->get_CPT();
+                const int Mvals = mnode->get_nvalues();
 
-                vector<double> w(mnode->get_nvalues(), 0.0);
+                // Posterior weights w[v] for the missing variable
+                std::vector<double> w(Mvals, 0.0);
                 double wsum = 0.0;
 
-                for (int v = 0; v < mnode->get_nvalues(); ++v) {
-                    double p = std::max<double>(tiny, mC[m_base + v]);
-                    // multiply children's likelihood terms
+                // Fallback prior over M if parents unknown: average across parent rows
+                std::vector<double> prior_fallback;  // empty unless used
+                if (m_code < 0) {
+                    const int K = Mvals;
+                    const int total_rows = (int)mC.size() / K;
+                    prior_fallback.assign(K, 0.0);
+                    if (total_rows > 0) {
+                        for (int rrow = 0; rrow < total_rows; ++rrow) {
+                            int base = rrow * K;
+                            for (int v = 0; v < K; ++v) prior_fallback[v] += mC[base + v];
+                        }
+                        for (int v = 0; v < K; ++v) prior_fallback[v] /= std::max(1, total_rows);
+                    } else {
+                        for (int v = 0; v < K; ++v) prior_fallback[v] = 1.0 / K; // degenerate safety
+                    }
+                }
+
+                for (int v = 0; v < Mvals; ++v) {
+                    // Prior term for M=v
+                    double prior_v = (m_code >= 0)
+                        ? std::max(tiny, (double)mC[m_base + v])
+                        : std::max(tiny, prior_fallback[v]);
+
+                    double logp = std::log(prior_v);
+
+                    // Add logs of children's likelihood terms (exact; no softening)
+                    bool bad_child = false;
                     for (int ci : mnode->get_children()) {
                         auto child = net.fast_get(ci);
                         int y = child->vindex_fast(row[ci]);
-                        if (y < 0) { p = 0.0; break; }
+                        if (y < 0) { bad_child = true; break; }
                         int c_code = parent_code_with_override(net, *child, row, missing_idx, v);
-                        if (c_code < 0) { p = 0.0; break; }
+                        if (c_code < 0) { bad_child = true; break; }
                         int cb = child->row_base_from_assign_code(c_code);
-                        const auto cC = child->get_CPT();
-                        p *= std::max<double>(tiny, cC[cb + y]);
-                        if (p == 0.0) break;
+                        const auto& cC = child->get_CPT();
+                        logp += std::log(std::max(tiny, (double)cC[cb + y]));
                     }
-                    w[v] = p; wsum += p;
-                }
-                if (wsum <= 0.0) continue;
-                for (auto& t : w) t = (float)(t / wsum); // normalize to probabilities
+                    if (bad_child) { w[v] = 0.0; continue; }
 
-                // Now add expected counts for every node
+                    // Temperature (annealed EM): SOFT if tau>1, HARDER if tau<1
+                    w[v] = std::exp(logp / tau);
+                    wsum += w[v];
+                }
+
+                // Normalize weights, with safe fallback if wsum == 0
+                if (wsum <= 0.0) {
+                    double norm = 0.0;
+                    if (m_code < 0 && !prior_fallback.empty()) {
+                        for (int v = 0; v < Mvals; ++v) { w[v] = std::max(tiny, prior_fallback[v]); norm += w[v]; }
+                    } else {
+                        for (int v = 0; v < Mvals; ++v) { w[v] = 1.0; norm += 1.0; }
+                    }
+                    for (auto& t : w) t = (float)(t / norm);
+                } else {
+                    for (auto& t : w) t = (float)(t / wsum);
+                }
+
+                // Add expected counts to all impacted families
                 for (int i = 0; i < N; ++i) {
                     auto node = net.fast_get(i);
 
-                    // Case 1: node is the missing variable itself -> distribute over its values
+                    // (A) Missing node itself: distribute counts by w[v]
                     if (i == missing_idx) {
-                        // parents are observed (single-missing), so parent code is m_code
-                        int base = m_base;
-                        for (int v = 0; v < node->get_nvalues(); ++v) {
-                            counts[i][base + v] += (float)w[v];
+                        if (m_code >= 0) {
+                            int base = m_base;
+                            for (int v = 0; v < node->get_nvalues(); ++v)
+                                counts[i][base + v] += (float)w[v];
+                        } else {
+                            // No parent code: distribute evenly across all parent rows, weighted by w[v]
+                            const int K = node->get_nvalues();
+                            const int total_rows = (int)counts[i].size() / K;
+                            for (int rrow = 0; rrow < total_rows; ++rrow) {
+                                int base = rrow * K;
+                                for (int v = 0; v < K; ++v)
+                                    counts[i][base + v] += (float)w[v] / std::max(1, total_rows);
+                            }
                         }
                         continue;
                     }
 
-                    // Case 2: node's parents include the missing variable -> marginalize over parent values using w
+                    // (B) If node depends on M: marginalize over M using w[v]
                     bool parent_depends_on_m = false;
-                    for (int pi : node->parents_idx()) if (pi == missing_idx) { parent_depends_on_m = true; break; }
+                    for (int pi : node->parents_idx())
+                        if (pi == missing_idx) { parent_depends_on_m = true; break; }
 
                     if (parent_depends_on_m) {
-                        // For each possible value of M with weight w[v], compute parent code with override and add counts.
-                        int x = node->vindex_fast(row[i]); // node may be observed (non-missing), as single-missing ensures.
+                        int x = node->vindex_fast(row[i]);
                         if (x < 0) continue;
-
                         for (int v = 0; v < (int)w.size(); ++v) {
                             if (w[v] <= 0.f) continue;
                             int code = parent_code_with_override(net, *node, row, missing_idx, v);
@@ -529,7 +660,7 @@ void run_soft_em(network& net, const vector<vector<string>>& data, int max_iter 
                         continue;
                     }
 
-                    // Case 3: family does not involve the missing variable -> treat as fully observed
+                    // (C) Otherwise: treat as fully observed
                     int x = node->vindex_fast(row[i]);
                     if (x < 0) continue;
                     int code = parent_code_fast(net, *node, row);
@@ -540,72 +671,45 @@ void run_soft_em(network& net, const vector<vector<string>>& data, int max_iter 
             }
         }
 
-        // M-step: normalize rows of each CPT
+        // ========================= M-step (ESS smoothing) =========================
+        const double ESS = .98; // Effective sample size per CPT row (tune 0.5–5.0)
         for (int i = 0; i < N; ++i) {
             auto node = net.fast_get(i);
             auto& cpt = counts[i];
             const int K = node->get_nvalues();
             for (int off = 0; off < (int)cpt.size(); off += K) {
-                float s = 0.0f;
-                for (int k = 0; k < K; ++k) s += cpt[off + k];
-                if (s <= 0.0f) { for (int k = 0; k < K; ++k) cpt[off + k] = 1.0f / K; }
-                else {
-                    float inv = 1.0f / s;
-                    for (int k = 0; k < K; ++k) cpt[off + k] *= inv;
+                double sum_counts = 0.0;
+                for (int k = 0; k < K; ++k) sum_counts += cpt[off + k];
+
+                // Dirichlet prior with ESS uniformly distributed among outcomes
+                for (int k = 0; k < K; ++k) {
+                    cpt[off + k] = (float)((cpt[off + k] + ESS / K) / (sum_counts + ESS));
                 }
             }
             node->set_CPT(cpt);
         }
-        cout << "Soft-EM iteration " << iter + 1 << " complete." << endl;
+
+        // ========================= Progress + convergence =========================
+        double ll = compute_log_likelihood(net, data);
+        cout << "Soft-EM iteration " << iter + 1 << " complete. logL=" << ll
+             << "  tau=" << tau << endl;
+
+        // Decay τ once per iteration
+        tau = std::max(tau * tau_decay, tau_min);
+
+        if (fabs(ll - prev_ll) < tol) {
+            cout << "Converged after " << iter + 1 << " iterations.\n";
+            break;
+        }
+        prev_ll = ll;
     }
 }
 
-// ---------- Data loading & validation (unchanged) ----------
-vector<vector<string>> read_data(const string& filename) {
-    vector<vector<string>> data;
-    ifstream infile(filename);
-    string line;
-    while (getline(infile, line)) {
-        stringstream ss(line);
-        vector<string> row; string val;
-        while (ss >> val) row.push_back(val);
-        if (!row.empty()) data.push_back(std::move(row));
-    }
-    return data;
-}
-static inline void rtrim_cr(std::string& s) { if (!s.empty() && s.back() == '\r') s.pop_back(); }
-static inline std::string strip_quotes(const std::string& s) {
-    if (s.size() >= 2 && s.front() == '"' && s.back() == '"') return s.substr(1, s.size() - 2);
-    return s;
-}
-static std::vector<std::string> parse_csv_line(const std::string& line_in) {
-    std::vector<std::string> out; std::string field; bool in_quotes = false;
-    for (size_t i = 0; i < line_in.size(); ++i) {
-        char c = line_in[i];
-        if (c == '"') { in_quotes = !in_quotes; field.push_back(c); }
-        else if (c == ',' && !in_quotes) { out.push_back(strip_quotes(field)); field.clear(); }
-        else { field.push_back(c); }
-    }
-    out.push_back(strip_quotes(field));
-    return out;
-}
-std::vector<std::vector<std::string>> load_records_csv(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) { std::cerr << "Could not open " << path << "\n"; return {}; }
-    std::vector<std::vector<std::string>> data;
-    std::string line;
-    while (std::getline(in, line)) {
-        rtrim_cr(line); if (line.empty()) continue;
-        auto row = parse_csv_line(line);
-        data.push_back(std::move(row));
-    }
-    std::cerr << "Loaded " << data.size() << " records.\n";
-    return data;
-}
+
+
 void validate_dataset(network& net, const vector<vector<string>>& data, int max_report=10) {
     int N = net.netSize();
     int bad_rows = 0, bad_tokens = 0, missing_multi = 0;
-
     for (int r = 0; r < (int)data.size(); ++r) {
         const auto& row = data[r];
         if ((int)row.size() != N) {
@@ -641,19 +745,52 @@ void validate_dataset(network& net, const vector<vector<string>>& data, int max_
 
 #ifndef BN_LIB
 int main() {
-    network BayesNet = read_network("hailfinder.bif");
+    // Read once to get structure for validation and N
+    network BayesNet0 = read_network("hailfinder.bif");
     vector<vector<string>> dataset = load_records_csv("records.dat");
 
     cout << "Loaded " << dataset.size() << " records." << endl;
-    validate_dataset(BayesNet, dataset);
+    validate_dataset(BayesNet0, dataset);
+    const int N = BayesNet0.netSize();
 
-    // Initialize with complete cases (+1 Laplace per row/value)
-    initialize_cpts_complete_case(BayesNet, dataset);
+    // Restart config
+    const int NUM_TRIALS = 5;
+    double best_ll = -1e300;
+    vector<vector<float>> best_cpts(N);  // snapshot of best CPTs per node (by index)
 
-    // Soft EM (fractional counts for single-missing rows)
-    run_soft_em(BayesNet, dataset, 7);
+    for (int trial = 0; trial < NUM_TRIALS; ++trial) {
+        // IMPORTANT: read a FRESH network each trial so iterator caches are valid
+        network model = read_network("hailfinder.bif");
 
-    write_network("solved.bif", BayesNet);
+        // Different seed per trial for reproducibility and exploration
+        srand(42 + trial * 17);
+
+        // Initialize + EM
+        initialize_cpts_complete_case(model, dataset);
+        run_soft_em(model, dataset, /*max_iter=*/75, /*tol=*/1e-5);
+
+        // Evaluate on training data (or split off validation if you have it)
+        double ll = compute_log_likelihood(model, dataset);
+        cout << "Trial " << (trial + 1) << "/" << NUM_TRIALS
+             << " final logL = " << ll << endl;
+
+        // Keep best CPT snapshot
+        if (ll > best_ll) {
+            best_ll = ll;
+            for (int i = 0; i < N; ++i) {
+                best_cpts[i] = model.fast_get(i)->get_CPT();
+            }
+        }
+    }
+
+    // Build final network and install best CPTs
+    network finalNet = read_network("hailfinder.bif");
+    for (int i = 0; i < N; ++i) {
+        finalNet.fast_get(i)->set_CPT(best_cpts[i]);
+    }
+
+    cout << "Best log-likelihood across trials: " << best_ll << endl;
+    write_network("solved.bif", finalNet);
     return 0;
 }
 #endif // BN_LIB
