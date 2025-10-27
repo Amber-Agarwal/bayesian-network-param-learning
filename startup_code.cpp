@@ -40,7 +40,7 @@ private:
     vector<string> Parents;
     int nvalues;
     vector<string> values;
-    vector<float> CPT; // FLOAT precision
+    vector<float> CPT;
 
     // caches
     vector<int> PIdx;
@@ -72,7 +72,7 @@ public:
         Children.push_back(new_child_index);
         return 1;
     }
-
+    // New functions
     void build_value_index()
     {
         Val2Idx.clear();
@@ -188,7 +188,7 @@ public:
 };
 
 // --------------------------- Utility Functions ---------------------------
-static inline string trim(string &str)
+string trim(const string &str)
 {
     size_t first = str.find_first_not_of(" \t\r\n");
     if (string::npos == first)
@@ -196,12 +196,12 @@ static inline string trim(string &str)
     size_t last = str.find_last_not_of(" \t\r\n");
     return str.substr(first, (last - first + 1));
 }
-static inline void rtrim_cr(string &s)
+void rtrim_cr(string &s)
 {
     if (!s.empty() && s.back() == '\r')
         s.pop_back();
 }
-static inline string strip_quotes(string &s)
+string strip_quotes(string &s)
 {
     if (s.size() >= 2 && s.front() == '"' && s.back() == '"')
         return s.substr(1, s.size() - 2);
@@ -1147,7 +1147,6 @@ void validate_dataset(network &net, vector<vector<string>> &data, int max_report
 #ifndef BN_LIB
 int main()
 {
-    srand(42);
 
     // Read once to get structure for validation and N
     network BayesNet0 = read_network("hailfinder.bif");
@@ -1175,9 +1174,6 @@ int main()
         cout << "\n=== Trial " << (trial + 1) << "/" << NUM_TRIALS << " ===\n";
         // Fresh network each trial (keeps caches valid)
         network model = read_network("hailfinder.bif");
-
-        // Different seed per trial for exploration
-        srand(42 + trial * 17);
 
         // Init with prior-centered counts
         initialize_cpts_with_prior(model, dataset, PRIOR_ESS);
