@@ -19,22 +19,6 @@ using namespace std;
 
 bool out = false;
 
-void sort_vector(vector<int> v)
-{
-    for (int i = 0; i < (int)v.size(); i++)
-        for (int j = i + 1; j < (int)v.size(); j++)
-            if (v[j] < v[i])
-                swap(v[i], v[j]);
-}
-
-int sum_vector(vector<int> v)
-{
-    int s = 0;
-    for (int x : v)
-        s += x;
-    return s;
-}
-
 float random_float()
 {
     return static_cast<float>(rand()) / RAND_MAX;
@@ -1324,11 +1308,10 @@ int main(int argv,char** argc)
         run_soft_then_exact_em(model, dataset, deadline, 60, 1e-5, MSTEP_ESS, 2.0, 0.90, 1.0);
 
         best_model = model;
-        if (!out)
+        if (!out) {
             initialize_uniform_cpt(model);
-
-        run_soft_then_exact_em(model, dataset, deadline, 30, 1e-5, MSTEP_ESS, 1.0, 0.95, 1.0);
-
+            run_soft_then_exact_em(model, dataset, deadline, 30, 1e-5, MSTEP_ESS, 1.0, 0.95, 1.0);
+        }
         model = best_model;
         double ll = compute_incomplete_log_likelihood(model, dataset);
         cout << "Trial " << (trial + 1) << " final logL = " << ll << endl;
@@ -1402,7 +1385,7 @@ int main(int argv,char** argc)
     double avg_ll = compute_incomplete_log_likelihood(finalNet, dataset);
     cout << "Averaged model logL: " << avg_ll << "\n";
 
-    write_network("solved.bif", finalNet);
+    write_network("solved_hailfinder.bif", finalNet);
     return 0;
 }
 #endif
