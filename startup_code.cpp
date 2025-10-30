@@ -69,13 +69,18 @@ public:
     Graph_Node(string name, int n, vector<string> vals)
     {
         Node_Name = move(name);
+    Graph_Node(string name, int n, vector<string> vals)
+    {
+        Node_Name = move(name);
         nvalues = n;
+        values = move(vals);
         values = move(vals);
     }
 
     string get_name() { return Node_Name; }
     vector<int> get_children() { return Children; }
     vector<string> get_Parents() { return Parents; }
+    vector<float> &get_CPT() { return CPT; }
     vector<float> &get_CPT() { return CPT; }
     int get_nvalues() { return nvalues; }
     vector<string> get_values() { return values; }
@@ -122,6 +127,8 @@ public:
         {
             auto &pn = Parents[j];
             auto it = name2idx.find(pn);
+            if (it == name2idx.end())
+                continue;
             if (it == name2idx.end())
                 continue;
             int pi = it->second;
@@ -172,8 +179,12 @@ class network
     list<Graph_Node> Pres_Graph;
     vector<list<Graph_Node>::iterator> index_cache;
     unordered_map<string, int> name2idx;
+    unordered_map<string, int> name2idx;
 
 public:
+    int addNode(Graph_Node node)
+    {
+        Pres_Graph.push_back(move(node));
     int addNode(Graph_Node node)
     {
         Pres_Graph.push_back(move(node));
@@ -187,6 +198,10 @@ public:
             if (count++ == i)
                 return it;
         return Pres_Graph.end();
+        for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it)
+            if (count++ == i)
+                return it;
+        return Pres_Graph.end();
     }
 
     int netSize() { return (int)Pres_Graph.size(); }
@@ -196,6 +211,8 @@ public:
         int count = 0;
         for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it, ++count)
             if (it->get_name() == val_name)
+        for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it, ++count)
+            if (it->get_name() == val_name)
                 return count;
         return -1;
     }
@@ -203,6 +220,9 @@ public:
     list<Graph_Node>::iterator get_nth_node(int n)
     {
         int count = 0;
+        for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it, ++count)
+            if (count == n)
+                return it;
         for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it, ++count)
             if (count == n)
                 return it;
@@ -224,7 +244,15 @@ public:
         index_cache.reserve(Pres_Graph.size());
         name2idx.clear();
         name2idx.reserve(Pres_Graph.size() * 2 + 1);
+    void finalize_index_cache()
+    {
+        index_cache.clear();
+        index_cache.reserve(Pres_Graph.size());
+        name2idx.clear();
+        name2idx.reserve(Pres_Graph.size() * 2 + 1);
         int i = 0;
+        for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it, ++i)
+        {
         for (auto it = Pres_Graph.begin(); it != Pres_Graph.end(); ++it, ++i)
         {
             index_cache.push_back(it);
@@ -501,8 +529,21 @@ network read_network(char *filename)
 
             auto listIt = BayesNet.search_node(node_name);
             int index = BayesNet.get_index(node_name);
+            int index = BayesNet.get_index(node_name);
 
             vector<string> parents;
+            if (bar != string::npos && bar < rp)
+            {
+                string parents_str = full.substr(bar + 1, rp - bar - 1);
+                stringstream ps(parents_str);
+                string p;
+                while (ps >> p)
+                {
+                    if (!p.empty() && p.back() == ',')
+                        p.pop_back();
+                    parents.push_back(p);
+                    auto pit = BayesNet.search_node(p);
+                    pit->add_child(index);
             if (bar != string::npos && bar < rp)
             {
                 string parents_str = full.substr(bar + 1, rp - bar - 1);
@@ -539,13 +580,27 @@ network read_network(char *filename)
                 }
                 else
                     part = line;
+                string part;
+                if (close_paren != string::npos)
+                    part = line.substr(close_paren + 1);
+                else if (line.find("table") != string::npos)
+                {
+                    size_t t = line.find("table");
+                    part = line.substr(t + 5);
+                }
+                else
+                    part = line;
 
                 string tok;
                 stringstream ss_prob(part);
                 while (ss_prob >> tok)
                 {
+                stringstream ss_prob(part);
+                while (ss_prob >> tok)
+                {
                     while (!tok.empty() && (tok.back() == ',' || tok.back() == ';'))
                         tok.pop_back();
+                    if (!tok.empty() && (isdigit((unsigned char)tok[0]) || tok[0] == '.' || tok[0] == '-' || tok[0] == '+'))
                     if (!tok.empty() && (isdigit((unsigned char)tok[0]) || tok[0] == '.' || tok[0] == '-' || tok[0] == '+'))
                         cpt.push_back(static_cast<float>(atof(tok.c_str())));
                 }
@@ -575,7 +630,12 @@ network read_network(char *filename)
 
 void write_network(char *filename, network &BayesNet)
 {
+void write_network(char *filename, network &BayesNet)
+{
     ofstream outfile(filename);
+    if (!outfile.is_open())
+    {
+        cerr << "Error writing " << filename << "\n";
     if (!outfile.is_open())
     {
         cerr << "Error writing " << filename << "\n";
@@ -588,14 +648,21 @@ void write_network(char *filename, network &BayesNet)
     {
         auto node = BayesNet.get_nth_node(i);
         outfile << "variable " << node->get_name() << " {\n";
+        outfile << "variable " << node->get_name() << " {\n";
         outfile << "  type discrete [ " << node->get_nvalues() << " ] = { ";
+        auto vals = node->get_values();
+        for (int j = 0; j < (int)vals.size(); j++)
+        {
         auto vals = node->get_values();
         for (int j = 0; j < (int)vals.size(); j++)
         {
             outfile << vals[j];
             if (j < (int)vals.size() - 1)
                 outfile << ", ";
+            if (j < (int)vals.size() - 1)
+                outfile << ", ";
         }
+        outfile << " };\n}\n";
         outfile << " };\n}\n";
     }
 
@@ -606,24 +673,39 @@ void write_network(char *filename, network &BayesNet)
         auto parents = node->get_Parents();
         auto values = node->get_values();
         auto &cpt = node->get_CPT();
+        auto parents = node->get_Parents();
+        auto values = node->get_values();
+        auto &cpt = node->get_CPT();
 
         outfile << "probability ( " << node->get_name();
+        if (!parents.empty())
+        {
         if (!parents.empty())
         {
             outfile << " | ";
             for (int j = 0; j < (int)parents.size(); j++)
             {
+            for (int j = 0; j < (int)parents.size(); j++)
+            {
                 outfile << parents[j];
+                if (j < (int)parents.size() - 1)
+                    outfile << ", ";
                 if (j < (int)parents.size() - 1)
                     outfile << ", ";
             }
         }
         outfile << " ) {\n";
+        outfile << " ) {\n";
 
         vector<int> radices;
         for (auto &pname : parents)
             radices.push_back(BayesNet.search_node(pname)->get_nvalues());
+        vector<int> radices;
+        for (auto &pname : parents)
+            radices.push_back(BayesNet.search_node(pname)->get_nvalues());
         int parent_combinations = 1;
+        for (int r : radices)
+            parent_combinations *= r;
         for (int r : radices)
             parent_combinations *= r;
 
@@ -636,7 +718,23 @@ void write_network(char *filename, network &BayesNet)
                 outfile << cpt[idx++];
                 if (k < (int)values.size() - 1)
                     outfile << ", ";
+        int idx = 0;
+        if (parents.empty())
+        {
+            outfile << "  table ";
+            for (int k = 0; k < (int)values.size(); k++)
+            {
+                outfile << cpt[idx++];
+                if (k < (int)values.size() - 1)
+                    outfile << ", ";
             }
+            outfile << ";\n";
+        }
+        else
+        {
+            for (int comb = 0; comb < parent_combinations; comb++)
+            {
+                vector<int> pidx(parents.size(), 0);
             outfile << ";\n";
         }
         else
@@ -667,10 +765,18 @@ void write_network(char *filename, network &BayesNet)
                     outfile << cpt[idx++];
                     if (k < (int)values.size() - 1)
                         outfile << ", ";
+                outfile << ") ";
+                for (int k = 0; k < (int)values.size(); k++)
+                {
+                    outfile << cpt[idx++];
+                    if (k < (int)values.size() - 1)
+                        outfile << ", ";
                 }
+                outfile << ";\n";
                 outfile << ";\n";
             }
         }
+        outfile << "};\n\n";
         outfile << "};\n\n";
     }
     outfile.close();
@@ -684,11 +790,18 @@ int compute_parent_code_fast(network &net, Graph_Node &node, vector<string> &row
     int code = 0;
     for (int p = 0; p < (int)PIdx.size(); ++p)
     {
+    for (int p = 0; p < (int)PIdx.size(); ++p)
+    {
         auto pnode = net.fast_get(PIdx[p]);
         string &tok = row[PIdx[p]];
         if (tok == "?")
             return -1;
+        string &tok = row[PIdx[p]];
+        if (tok == "?")
+            return -1;
         int a = pnode->vindex_fast(tok);
+        if (a < 0)
+            return -1;
         if (a < 0)
             return -1;
         code += a * PStr[p];
@@ -711,11 +824,20 @@ int compute_parent_code_with_override(network &net, Graph_Node &node, vector<str
             a = override_val;
         else
         {
+        if (idx == override_idx)
+            a = override_val;
+        else
+        {
             auto pnode = net.fast_get(idx);
             string &tok = row[idx];
             if (tok == "?")
                 return -1;
+            string &tok = row[idx];
+            if (tok == "?")
+                return -1;
             a = pnode->vindex_fast(tok);
+            if (a < 0)
+                return -1;
             if (a < 0)
                 return -1;
         }
@@ -853,8 +975,11 @@ void initialize_cpts_with_prior(network &net,
     int N = net.netSize();
 
     vector<vector<float>> prior(N);
+    vector<vector<float>> prior(N);
     vector<int> nvals(N), parent_combos(N);
 
+    for (int i = 0; i < N; ++i)
+    {
     for (int i = 0; i < N; ++i)
     {
         auto node = net.fast_get(i);
@@ -862,6 +987,8 @@ void initialize_cpts_with_prior(network &net,
         auto &pcpt = node->get_CPT();
         prior[i] = pcpt;
         long long prod = 1;
+        for (int r : node->parent_rad())
+        {
         for (int r : node->parent_rad())
         {
             prod *= r;
@@ -899,7 +1026,7 @@ void initialize_cpts_with_prior(network &net,
             if (code < 0)
                 continue;
             int base = node->row_base_from_assign_code(code);
-            counts[i][base + x] += 1.0f;
+            counts[i][base + x] += 1.0;
         }
     }
 
@@ -943,6 +1070,8 @@ void initialize_cpts_with_prior(network &net,
         }
         node->set_CPT(c);
     }
+
+    cerr << "Initialized CPTs with prior-centered Dirichlet (ESS=" << prior_ess << ").\n";
 
     cerr << "Initialized CPTs with prior-centered Dirichlet (ESS=" << prior_ess << ").\n";
 }
@@ -1015,7 +1144,7 @@ void run_soft_then_exact_em(network &net, vector<vector<string>> &data, chrono::
                     if (code < 0)
                         continue;
                     int base = node->row_base_from_assign_code(code);
-                    counts[i][base + x] += 1.0f;
+                    counts[i][base + x] += 1.0;
                 }
             }
             else
@@ -1245,6 +1374,11 @@ void validate_dataset(network &net, vector<vector<string>> &data, int max_report
         auto &row = data[r];
         if ((int)row.size() != N)
         {
+    for (int r = 0; r < (int)data.size(); ++r)
+    {
+        auto &row = data[r];
+        if ((int)row.size() != N)
+        {
             if (++bad_rows <= max_report)
                 cerr << "[ROW LEN] r=" << r << " has " << row.size() << " cols; expected " << N << "\n";
             continue;
@@ -1275,6 +1409,8 @@ void validate_dataset(network &net, vector<vector<string>> &data, int max_report
                          << " value='" << tok << "' not in node's domain\n";
             }
         }
+        if (q > 1)
+        {
         if (q > 1)
         {
             ++missing_multi;
@@ -1401,6 +1537,7 @@ int main(int argv,char** argc)
     double avg_ll = compute_incomplete_log_likelihood(finalNet, dataset);
     cout << "Averaged model logL: " << avg_ll << "\n";
 
+    write_network("solved.bif", finalNet);
     write_network("solved.bif", finalNet);
     return 0;
 }
