@@ -1,4 +1,3 @@
-
 #include <iostream>
 #include <string>
 #include <vector>
@@ -18,22 +17,6 @@
 using namespace std;
 
 bool out = false;
-
-void sort_vector(vector<int> v)
-{
-    for (int i = 0; i < (int)v.size(); i++)
-        for (int j = i + 1; j < (int)v.size(); j++)
-            if (v[j] < v[i])
-                swap(v[i], v[j]);
-}
-
-int sum_vector(vector<int> v)
-{
-    int s = 0;
-    for (int x : v)
-        s += x;
-    return s;
-}
 
 float random_float()
 {
@@ -65,7 +48,7 @@ private:
     vector<int> PRad;
     vector<int> PStr;
     unordered_map<string, int> Val2Idx;
-
+    vector<uint8_t> CPT_mask; // 1 = learnable (-1 in input), 0 = fixed
 public:
     Graph_Node(string name, int n, vector<string> vals)
     {
@@ -82,7 +65,8 @@ public:
     vector<string> get_values() { return values; }
     void set_CPT(vector<float> new_CPT) { CPT.swap(new_CPT); }
     void set_Parents(vector<string> Parent_Nodes) { Parents = move(Parent_Nodes); }
-
+    void set_CPT_mask(const vector<uint8_t>& m) { CPT_mask = m; }
+    vector<uint8_t>& get_CPT_mask() { return CPT_mask; }
     int add_child(int new_child_index)
     {
         for (int c : Children)
@@ -521,6 +505,7 @@ network read_network(char *filename)
             listIt->set_Parents(parents);
 
             vector<float> cpt;
+            vector<uint8_t> mask;
             while (getline(myfile, line))
             {
                 line = perform_trim(line);
@@ -548,10 +533,15 @@ network read_network(char *filename)
                     while (!tok.empty() && (tok.back() == ',' || tok.back() == ';'))
                         tok.pop_back();
                     if (!tok.empty() && (isdigit((unsigned char)tok[0]) || tok[0] == '.' || tok[0] == '-' || tok[0] == '+'))
-                        cpt.push_back(static_cast<float>(atof(tok.c_str())));
+                    {
+                        float val = static_cast<float>(atof(tok.c_str()));
+                        cpt.push_back(val);
+                        mask.push_back(val < 0.0f ? 1 : 0);  // 1 if -1 (unknown)
+                    }
                 }
             }
             listIt->set_CPT(cpt);
+            listIt->set_CPT_mask(mask);
         }
     }
     myfile.close();
@@ -847,9 +837,55 @@ double compute_incomplete_log_likelihood(network &net, vector<vector<string>> &d
     return total;
 }
 
-void initialize_cpts_with_prior(network &net,
-                                vector<vector<string>> &data,
-                                double prior_ess)
+void initialize_uniform_cpt(network &net)
+{
+    int N = net.netSize();
+    for (int i = 0; i < N; ++i)
+    {
+        auto node = net.fast_get(i);
+        int K = node->get_nvalues();
+        long long prod = 1;
+        for (int r : node->parent_rad())
+            prod *= r;
+        int rows = (int)prod;
+        vector<float> cpt(rows * K, 1.0f / K);
+        auto &mask = node->get_CPT_mask();
+
+        // if any CPT entries are fixed, preserve them and renormalize learnables
+        for (int off = 0; off < rows * K; off += K)
+        {
+            double fixed_sum = 0.0, learn_sum = 0.0;
+            for (int k = 0; k < K; ++k)
+            {
+                if (!mask[off + k])
+                    fixed_sum += cpt[off + k];
+                else
+                    learn_sum += cpt[off + k];
+            }
+            double residual = 1.0 - fixed_sum;
+            if (residual < 0.0)
+                residual = 0.0;
+            if (learn_sum > 1e-12)
+            {
+                double scale = residual / learn_sum;
+                for (int k = 0; k < K; ++k)
+                    if (mask[off + k])
+                        cpt[off + k] = (float)(cpt[off + k] * scale);
+            }
+        }
+
+        node->set_CPT(cpt);
+    }
+    cerr << "Initialized CPTs with fixed-aware uniform distributions.\n";
+}
+
+// =============================================================
+// Initialize CPTs while preserving fixed entries
+// =============================================================
+void initialize_cpts_with_prior(
+    network &net,
+    vector<vector<string>> &data,
+    double prior_ess)  // 0=fixed, 1=learnable
 {
     int N = net.netSize();
 
@@ -860,13 +896,10 @@ void initialize_cpts_with_prior(network &net,
     {
         auto node = net.fast_get(i);
         nvals[i] = node->get_nvalues();
-        auto &pcpt = node->get_CPT();
-        prior[i] = pcpt;
+        prior[i] = node->get_CPT();
         long long prod = 1;
         for (int r : node->parent_rad())
-        {
             prod *= r;
-        }
         parent_combos[i] = (int)prod;
     }
 
@@ -874,368 +907,291 @@ void initialize_cpts_with_prior(network &net,
     for (int i = 0; i < N; ++i)
         counts[i].assign(parent_combos[i] * nvals[i], 0.0f);
 
-    for (size_t ri = 0; ri < data.size(); ++ri)
+    // count only complete records
+    for (auto &row : data)
     {
-        auto &row = data[ri];
         if ((int)row.size() != N)
             continue;
-
-        bool has_missing = false;
-        for (size_t ti = 0; ti < row.size(); ++ti)
-            if (row[ti] == "?")
-            {
-                has_missing = true;
-                break;
-            }
-        if (has_missing)
-            continue;
+        bool has_missing = any_of(row.begin(), row.end(), [](auto &x){return x == "?";});
+        if (has_missing) continue;
 
         for (int i = 0; i < N; ++i)
         {
             auto node = net.fast_get(i);
+            auto &mask = node->get_CPT_mask();
             int x = node->vindex_fast(row[i]);
-            if (x < 0)
-                continue;
+            if (x < 0) continue;
             int code = compute_parent_code_fast(net, *node, row);
-            if (code < 0)
-                continue;
+            if (code < 0) continue;
             int base = node->row_base_from_assign_code(code);
             counts[i][base + x] += 1.0f;
         }
     }
 
+    // combine prior + data + mask
     for (int i = 0; i < N; ++i)
     {
         auto node = net.fast_get(i);
+        auto &mask = node->get_CPT_mask();
         int K = nvals[i];
         auto &c = counts[i];
         auto &p = prior[i];
 
         for (int off = 0; off < (int)c.size(); off += K)
         {
-            double sum_c = 0.0;
-            for (int k = 0; k < K; ++k)
-                sum_c += c[off + k];
+            double fixed_sum = 0.0;
+            double learn_sum = 0.0;
 
-            double denom = sum_c + prior_ess;
-            if (denom < 1e-12)
-                denom = 1e-12;
-
+            // raw Dirichlet update for learnables
             for (int k = 0; k < K; ++k)
             {
-                double alpha_k = prior_ess * max((double)1e-12, (double)p[off + k]);
-                c[off + k] = static_cast<float>((c[off + k] + alpha_k) / denom);
+                if (!mask[off + k])
+                {
+                    c[off + k] = p[off + k];  // fixed value preserved
+                    fixed_sum += c[off + k];
+                }
+                else
+                {
+                    double alpha_k = prior_ess * max(1e-12, (double)p[off + k]);
+                    c[off + k] = (float)(c[off + k] + alpha_k);
+                    learn_sum += c[off + k];
+                }
             }
 
-            double s = 0.0;
-            for (int k = 0; k < K; ++k)
-                s += c[off + k];
-            if (s < 1e-12)
+            double residual = 1.0 - fixed_sum;
+            if (residual < 0.0) residual = 0.0;
+
+            if (learn_sum <= 1e-12)
             {
+                double uniform = (residual > 0 ? residual : 1.0) / max(1, (int)count_if(mask.begin()+off, mask.begin()+off+K, [](uint8_t m){return m==1;}));
                 for (int k = 0; k < K; ++k)
-                    c[off + k] = static_cast<float>(1.0 / K);
+                    if (mask[off + k])
+                        c[off + k] = (float)uniform;
             }
             else
             {
-                double inv = 1.0 / s;
+                double scale = residual / learn_sum;
                 for (int k = 0; k < K; ++k)
-                    c[off + k] = static_cast<float>(c[off + k] * inv);
+                    if (mask[off + k])
+                        c[off + k] *= (float)scale;
+            }
+
+            // small safety renorm
+            double s = 0.0;
+            for (int k = 0; k < K; ++k)
+                s += c[off + k];
+            if (fabs(s - 1.0) > 1e-3)
+            {
+                for (int k = 0; k < K; ++k)
+                    c[off + k] = (float)(c[off + k] / s);
             }
         }
         node->set_CPT(c);
     }
-
-    cerr << "Initialized CPTs with prior-centered Dirichlet (ESS=" << prior_ess << ").\n";
+    cerr << "Initialized CPTs with fixed-aware Dirichlet (ESS=" << prior_ess << ")\n";
 }
 
-void initialize_uniform_cpt(network &net)
+
+// =============================================================
+// EM learning (soft then exact) with fixed-aware normalization
+// =============================================================
+void run_soft_then_exact_em(network &net,
+                                       vector<vector<string>> &data,
+                                       chrono::steady_clock::time_point deadline,
+                                       int max_iter_soft,
+                                       double tol,
+                                       double ESS,
+                                       double tau_init,
+                                       double tau_decay,
+                                       double tau_min)
 {
     int N = net.netSize();
-    for (int i = 0; i < N; ++i)
-    {
-        auto node = net.fast_get(i);
-        int K = node->get_nvalues();
-        long long prod = 1;
-        for (int r : node->parent_rad())
-        {
-            prod *= r;
-        }
-        int rows = (int)prod;
-        vector<float> cpt(rows * K, 1.0f / K);
-        node->set_CPT(cpt);
-    }
-    cerr << "Initialized CPTs with uniform distributions.\n";
-}
-
-void run_soft_then_exact_em(network &net, vector<vector<string>> &data, chrono::steady_clock::time_point deadline,
-                            int max_iter_soft, double tol,
-                            double ESS,
-                            double tau_init, double tau_decay, double tau_min)
-{
-    int N = net.netSize();
-    float tiny = 1e-12f;
-
+    const float tiny = 1e-12f;
     vector<vector<float>> counts(N);
+
     for (int i = 0; i < N; ++i)
     {
         auto node = net.fast_get(i);
         long long prod = 1;
         for (int r : node->parent_rad())
-        {
-            if (r <= 0 || prod > (LLONG_MAX / r))
-                throw runtime_error("Parent combos too large");
             prod *= r;
-        }
         counts[i].assign((int)prod * node->get_nvalues(), 0.0f);
     }
 
-    auto em_pass = [&](double tau)
+    double tau = tau_init;
+    double prev_ll = -1e300;
+
+    for (int iter = 0; iter < max_iter_soft; ++iter)
     {
-        for (size_t ri = 0; ri < data.size(); ++ri)
+        if (chrono::steady_clock::now() > deadline)
         {
-            auto &row = data[ri];
-            if ((int)row.size() != N)
-                continue;
+            cout << "⏱ EM stopped early (time limit) at iter " << (iter+1) << "\n";
+            break;
+        }
 
-            int missing_idx = -1, q = 0;
+        for (auto &v : counts)
+            fill(v.begin(), v.end(), 0.0f);
+
+        // === E-step (optimized for ≤1 missing per record)
+        for (auto &row : data)
+        {
+            if ((int)row.size() != N) continue;
+            int missing_idx = -1;
             for (int i = 0; i < N; ++i)
-                if (row[i] == "?" && ++q == 1)
-                    missing_idx = i;
-            if (q > 1)
-                continue;
+                if (row[i] == "?") { missing_idx = i; break; }
 
-            if (q == 0)
+            if (missing_idx == -1)
             {
+                // complete case
                 for (int i = 0; i < N; ++i)
                 {
                     auto node = net.fast_get(i);
                     int x = node->vindex_fast(row[i]);
-                    if (x < 0)
-                        continue;
+                    if (x < 0) continue;
                     int code = compute_parent_code_fast(net, *node, row);
-                    if (code < 0)
-                        continue;
-                    int base = node->row_base_from_assign_code(code);
-                    counts[i][base + x] += 1.0f;
+                    if (code < 0) continue;
+                    counts[i][node->row_base_from_assign_code(code) + x] += 1.0f;
+                }
+                continue;
+            }
+
+            // incomplete case (only one missing)
+            int m = missing_idx;
+            auto mnode = net.fast_get(m);
+            auto &mCPT = mnode->get_CPT();
+            int K = mnode->get_nvalues();
+            int m_code = compute_parent_code_fast(net, *mnode, row);
+            int m_base = (m_code >= 0 ? mnode->row_base_from_assign_code(m_code) : 0);
+
+            vector<double> logp(K, -1e300);
+            double max_lp = -1e300;
+            for (int v = 0; v < K; ++v)
+            {
+                double lp = log(max((double)tiny, (double)mCPT[m_base + v]));
+                bool bad = false;
+                for (int ci : mnode->get_children())
+                {
+                    auto child = net.fast_get(ci);
+                    int y = child->vindex_fast(row[ci]);
+                    if (y < 0) { bad = true; break; }
+                    int c_code = compute_parent_code_with_override(net, *child, row, m, v);
+                    if (c_code < 0) { bad = true; break; }
+                    int cb = child->row_base_from_assign_code(c_code);
+                    auto &cC = child->get_CPT();
+                    lp += log(max((double)tiny, (double)cC[cb + y]));
+                }
+                if (!bad)
+                {
+                    logp[v] = lp;
+                    if (lp > max_lp) max_lp = lp;
                 }
             }
-            else
+            vector<double> w(K);
+            double sumw = 0.0;
+            for (int v = 0; v < K; ++v)
             {
-                int m = missing_idx;
-                auto mnode = net.fast_get(m);
+                if (logp[v] <= -1e299) w[v] = 0.0;
+                else w[v] = exp((logp[v] - max_lp) / max(1.0, tau));
+                sumw += w[v];
+            }
+            if (sumw <= 0.0) fill(w.begin(), w.end(), 1.0 / K);
+            else for (int v = 0; v < K; ++v) w[v] /= sumw;
 
-                int m_code = compute_parent_code_fast(net, *mnode, row);
-                int m_base = (m_code >= 0) ? mnode->row_base_from_assign_code(m_code) : 0;
-                auto &mC = mnode->get_CPT();
-                int K = mnode->get_nvalues();
-
-                vector<double> w(K, 0.0);
-                double max_lp = -1e300;
-
-                vector<float> prior_fb;
-                if (m_code < 0)
-                {
-                    int total_rows = (int)mC.size() / K;
-                    prior_fb.assign(K, 0.0f);
-                    if (total_rows > 0)
-                    {
-                        for (int rr = 0; rr < total_rows; ++rr)
-                        {
-                            int base = rr * K;
-                            for (int v = 0; v < K; ++v)
-                                prior_fb[v] += mC[base + v];
-                        }
-                        for (int v = 0; v < K; ++v)
-                            prior_fb[v] /= max(1, total_rows);
-                    }
-                    else
-                    {
-                        for (int v = 0; v < K; ++v)
-                            prior_fb[v] = 1.0f / K;
-                    }
-                }
-
-                vector<double> lps(K, -1e300);
-                for (int v = 0; v < K; ++v)
-                {
-                    double prior_v = (m_code >= 0) ? max((double)tiny, (double)mC[m_base + v])
-                                                   : max((double)tiny, (double)prior_fb[v]);
-                    double logp = log(prior_v);
-
-                    bool bad = false;
-                    for (int ci : mnode->get_children())
-                    {
-                        auto child = net.fast_get(ci);
-                        int y = child->vindex_fast(row[ci]);
-                        if (y < 0)
-                        {
-                            bad = true;
-                            break;
-                        }
-                        int c_code = compute_parent_code_with_override(net, *child, row, m, v);
-                        if (c_code < 0)
-                        {
-                            bad = true;
-                            break;
-                        }
-                        int cb = child->row_base_from_assign_code(c_code);
-                        auto &cC = child->get_CPT();
-                        logp += log(max((double)tiny, (double)cC[cb + y]));
-                    }
-                    if (bad)
-                    {
-                        lps[v] = -1e300;
-                        continue;
-                    }
-                    lps[v] = logp;
-                    if (logp > max_lp)
-                        max_lp = logp;
-                }
-
-                double wsum = 0.0;
-                for (int v = 0; v < K; ++v)
-                {
-                    if (lps[v] <= -1e299)
-                    {
-                        w[v] = 0.0;
-                        continue;
-                    }
-                    w[v] = exp((lps[v] - max_lp) / max(1.0, tau));
-                    wsum += w[v];
-                }
-                if (wsum <= 0.0)
+            // weighted updates
+            for (int i = 0; i < N; ++i)
+            {
+                auto node = net.fast_get(i);
+                if (i == m)
                 {
                     for (int v = 0; v < K; ++v)
-                        w[v] = 1.0 / K;
+                        counts[i][m_base + v] += (float)w[v];
+                    continue;
+                }
+
+                bool depends = false;
+                for (int pi : node->parents_idx())
+                    if (pi == m) { depends = true; break; }
+
+                int x = node->vindex_fast(row[i]);
+                if (x < 0) continue;
+
+                if (depends)
+                {
+                    for (int v = 0; v < K; ++v)
+                    {
+                        int code = compute_parent_code_with_override(net, *node, row, m, v);
+                        if (code < 0) continue;
+                        counts[i][node->row_base_from_assign_code(code) + x] += (float)w[v];
+                    }
                 }
                 else
                 {
-                    for (int v = 0; v < K; ++v)
-                        w[v] /= wsum;
-                }
-
-                for (int i = 0; i < N; ++i)
-                {
-                    auto node = net.fast_get(i);
-
-                    if (i == m)
-                    {
-                        if (m_code >= 0)
-                        {
-                            int base = m_base;
-                            for (int v = 0; v < K; ++v)
-                                counts[i][base + v] += (float)w[v];
-                        }
-                        else
-                        {
-                            int total_rows = (int)counts[i].size() / K;
-                            for (int rr = 0; rr < total_rows; ++rr)
-                            {
-                                int base = rr * K;
-                                for (int v = 0; v < K; ++v)
-                                    counts[i][base + v] += (float)(w[v] / max(1, total_rows));
-                            }
-                        }
-                        continue;
-                    }
-
-                    bool parent_depends_on_m = false;
-                    for (int pi : node->parents_idx())
-                        if (pi == m)
-                        {
-                            parent_depends_on_m = true;
-                            break;
-                        }
-
-                    if (parent_depends_on_m)
-                    {
-                        int x = node->vindex_fast(row[i]);
-                        if (x < 0)
-                            continue;
-                        for (size_t vv = 0; vv < w.size(); ++vv)
-                        {
-                            if (w[vv] <= 0.0)
-                                continue;
-                            int code = compute_parent_code_with_override(net, *node, row, m, (int)vv);
-                            if (code < 0)
-                                continue;
-                            int base = node->row_base_from_assign_code(code);
-                            counts[i][base + x] += (float)w[vv];
-                        }
-                        continue;
-                    }
-
-                    int x = node->vindex_fast(row[i]);
-                    if (x < 0)
-                        continue;
                     int code = compute_parent_code_fast(net, *node, row);
-                    if (code < 0)
-                        continue;
-                    int base = node->row_base_from_assign_code(code);
-                    counts[i][base + x] += 1.0f;
+                    if (code < 0) continue;
+                    counts[i][node->row_base_from_assign_code(code) + x] += 1.0f;
                 }
             }
         }
 
+        // === M-step (fixed-aware normalization)
         for (int i = 0; i < N; ++i)
         {
             auto node = net.fast_get(i);
+            auto &mask = node->get_CPT_mask();
             auto &cpt = counts[i];
             int K = node->get_nvalues();
 
             for (int off = 0; off < (int)cpt.size(); off += K)
             {
-                double sum_counts = 0.0;
-                for (int k = 0; k < K; ++k)
-                    sum_counts += cpt[off + k];
-
-                double denom = sum_counts + ESS;
-                if (denom < tiny)
-                    denom = tiny;
-
+                double fixed_sum = 0.0, learn_sum = 0.0;
                 for (int k = 0; k < K; ++k)
                 {
-                    float num = cpt[off + k] + ESS / K;
-                    float p = num / denom;
-                    cpt[off + k] = max(tiny, p);
+                    if (!mask[off + k])
+                    {
+                        cpt[off + k] = node->get_CPT()[off + k];
+                        fixed_sum += cpt[off + k];
+                    }
+                    else
+                    {
+                        cpt[off + k] += (float)(ESS / K);
+                        learn_sum += cpt[off + k];
+                    }
                 }
+
+                double residual = 1.0 - fixed_sum;
+                if (residual < 0.0) residual = 0.0;
+                if (learn_sum > 1e-12)
+                {
+                    double scale = residual / learn_sum;
+                    for (int k = 0; k < K; ++k)
+                        if (mask[off + k])
+                            cpt[off + k] *= (float)scale;
+                }
+
                 double s = 0.0;
                 for (int k = 0; k < K; ++k)
                     s += cpt[off + k];
-                double inv = 1.0 / s;
-                for (int k = 0; k < K; ++k)
-                    cpt[off + k] = (float)(cpt[off + k] * inv);
+                if (s > 1e-12)
+                    for (int k = 0; k < K; ++k)
+                        cpt[off + k] /= (float)s;
             }
             node->set_CPT(cpt);
         }
-    };
-
-    double tau = tau_init;
-    double prev_ll = -1e300;
-    for (int iter = 0; iter < max_iter_soft; ++iter)
-    {
-        if (chrono::steady_clock::now() > deadline)
-        {
-            best_model = net;
-            out = true;
-            cout << "Reached time limit during EM; stopping early at iter " << (iter + 1) << ".\n";
-            break;
-        }
-        em_pass(tau);
 
         double ll = compute_incomplete_log_likelihood(net, data);
-        cout << "EM iter " << (iter + 1) << " | logL=" << ll << "  tau=" << tau << "\n";
-
-        tau = max(tau * tau_decay, tau_min);
+        cout << "Iter " << (iter+1) << " | logL=" << ll << " | tau=" << tau << "\n";
 
         if (fabs(ll - prev_ll) < tol)
         {
-            cout << "Soft EM converged at iter " << (iter + 1) << ".\n";
+            cout << "Converged at iter " << (iter+1) << "\n";
             break;
         }
+
         prev_ll = ll;
+        tau = max(tau * tau_decay, tau_min);
     }
 }
+
 
 void validate_dataset(network &net, vector<vector<string>> &data, int max_report)
 {
@@ -1318,17 +1274,17 @@ int main(int argv,char** argc)
     {
         cout << "\n=== Trial " << (trial + 1) << "/" << NUM_TRIALS << " ===\n";
         network model = read_network(bif_path);
-
+        // print cpt
+        
         initialize_cpts_with_prior(model, dataset, PRIOR_ESS);
 
         run_soft_then_exact_em(model, dataset, deadline, 60, 1e-5, MSTEP_ESS, 2.0, 0.90, 1.0);
 
         best_model = model;
-        if (!out)
+        if (!out) {
             initialize_uniform_cpt(model);
-
-        run_soft_then_exact_em(model, dataset, deadline, 30, 1e-5, MSTEP_ESS, 1.0, 0.95, 1.0);
-
+            run_soft_then_exact_em(model, dataset, deadline, 30, 1e-5, MSTEP_ESS, 1.0, 0.95, 1.0);
+        }
         model = best_model;
         double ll = compute_incomplete_log_likelihood(model, dataset);
         cout << "Trial " << (trial + 1) << " final logL = " << ll << endl;
