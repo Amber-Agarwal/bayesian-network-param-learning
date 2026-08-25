@@ -1358,7 +1358,7 @@ int main(int argv,char** argc)
     double avg_ll = compute_incomplete_log_likelihood(finalNet, dataset);
     cout << "Averaged model logL: " << avg_ll << "\n";
 
-    write_network("solved.bif", finalNet);
+    write_network("solved_hailfinder.bif", finalNet);
     return 0;
 }
 #endif
